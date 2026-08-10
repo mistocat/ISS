@@ -75,8 +75,12 @@ An input that cannot be parsed or run is an error, not guidance: it is reported
 as \`<file>:1: error: ...\` and always exits non-zero.`;
 
 const parseGridCell = (cell) => {
-  const match = /^R(\d+)C(\d+)$/.exec(cell);
-  return match ? { row: +match[1], col: +match[2] } : null;
+  // Canonical ids are single base-17 characters per axis (CELL_ID_CHAR), so
+  // rows/columns 10-16 are letters: R10C4 serializes as RaC4.
+  const match = /^R([1-9a-g])C([1-9a-g])$/i.exec(cell);
+  return match
+    ? { row: parseInt(match[1], 17), col: parseInt(match[2], 17) }
+    : null;
 };
 
 const isOrthAdjacent = (a, b) =>
@@ -203,8 +207,13 @@ const boxSize = (geometry, regionSize) =>
 // every row and column, plus default boxes unless NoBoxes is present.
 const enforcedHouseSets = (geometry, hasNoBoxes, regionSize) => {
   const houses = new Map();
+  // Only the Sudoku grid type has implicit houses (SudokuBuilder._handlers);
+  // a Raw grid enforces nothing, so nothing an encoding states is redundant.
+  if (geometry.gridType !== CellGeometry.SUDOKU_GRID_TYPE) return houses;
   const addHouse = (label, cells) => {
-    houses.set(cells.map(c => `R${c.row}C${c.col}`).sort().join(','), label);
+    // Keys must match the serialized form's base-17 cell ids (RaC4, not R10C4).
+    houses.set(cells.map(
+      c => `R${c.row.toString(17)}C${c.col.toString(17)}`).sort().join(','), label);
   };
 
   for (let r = 1; r <= geometry.numRows; r++) {
