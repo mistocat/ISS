@@ -14,21 +14,19 @@ const {
   camelCaseToWords,
   arrayDifference,
   arrayIntersect,
-  arrayIntersectSize,
   arrayRemoveValue,
   arraysAreEqual,
   mergeSortedArrays,
+  sortedArrayCopy,
+  insertionSortInts,
   elementarySymmetricSum,
-  setIntersectionToArray,
   setIntersectSize,
-  setDifference,
   setPeek,
   countOnes16bit,
   countOnes32bit,
   requiredBits,
   memoize,
   isIterable,
-  isPlainObject,
   shuffleArray,
   BitWriter,
   BitReader,
@@ -39,7 +37,6 @@ const {
   RandomIntGenerator,
   canonicalJSON,
   Timer,
-  IteratorWithCount,
 } = await import('../../js/util.js');
 
 // ============================================================================
@@ -126,10 +123,6 @@ await runTest('arrayIntersect should return common elements', () => {
   assert.deepEqual(arrayIntersect([1, 2, 3], [2, 3, 4]), [2, 3]);
 });
 
-await runTest('arrayIntersectSize should return count of common elements', () => {
-  assert.equal(arrayIntersectSize([1, 2, 3], [2, 3, 4]), 2);
-});
-
 await runTest('arrayRemoveValue should remove value from array', () => {
   const arr = [1, 2, 3, 4];
   arrayRemoveValue(arr, 2);
@@ -152,6 +145,53 @@ await runTest('arraysAreEqual should return false for different arrays', () => {
 
 await runTest('arraysAreEqual should return false for different lengths', () => {
   assert.equal(arraysAreEqual([1, 2], [1, 2, 3]), false);
+});
+
+await runTest('sortedArrayCopy should copy an already-sorted array', () => {
+  const input = [1, 4, 9];
+  const result = sortedArrayCopy(input);
+
+  assert.deepEqual(result, [1, 4, 9]);
+  // A copy, not the input.
+  assert.notEqual(result, input);
+});
+
+await runTest('sortedArrayCopy should sort an unsorted array', () => {
+  const input = [9, 1, 4];
+  assert.deepEqual(sortedArrayCopy(input), [1, 4, 9]);
+  // The input is left alone.
+  assert.deepEqual(input, [9, 1, 4]);
+});
+
+await runTest('sortedArrayCopy should sort numerically, not lexicographically', () => {
+  assert.deepEqual(sortedArrayCopy([10, 9, 100, 2]), [2, 9, 10, 100]);
+});
+
+await runTest('sortedArrayCopy should keep duplicates by default', () => {
+  // Sorted-with-duplicates is not a violation when duplicates are allowed.
+  assert.deepEqual(sortedArrayCopy([1, 1, 4]), [1, 1, 4]);
+  assert.deepEqual(sortedArrayCopy([4, 1, 1]), [1, 1, 4]);
+});
+
+await runTest('sortedArrayCopy should remove duplicates when asked', () => {
+  assert.deepEqual(sortedArrayCopy([1, 1, 4], true), [1, 4]);
+  assert.deepEqual(sortedArrayCopy([4, 1, 4, 1], true), [1, 4]);
+  // Already strictly ascending: unchanged.
+  assert.deepEqual(sortedArrayCopy([1, 4, 9], true), [1, 4, 9]);
+});
+
+await runTest('sortedArrayCopy should accept typed arrays and return a plain Array', () => {
+  const result = sortedArrayCopy(new Uint16Array([9, 1, 1, 4]), true);
+
+  assert.ok(Array.isArray(result));
+  assert.deepEqual(result, [1, 4, 9]);
+});
+
+await runTest('sortedArrayCopy should handle empty and single-element input', () => {
+  assert.deepEqual(sortedArrayCopy([]), []);
+  assert.deepEqual(sortedArrayCopy([], true), []);
+  assert.deepEqual(sortedArrayCopy([7]), [7]);
+  assert.deepEqual(sortedArrayCopy([7], true), [7]);
 });
 
 await runTest('mergeSortedArrays should merge two sorted arrays', () => {
@@ -217,23 +257,10 @@ await runTest('elementarySymmetricSum should return 1 for k=0', () => {
 // Set utilities
 // ============================================================================
 
-await runTest('setIntersectionToArray should return intersection as array', () => {
-  const a = new Set([1, 2, 3]);
-  const b = [2, 3, 4];
-  assert.deepEqual(setIntersectionToArray(a, b), [2, 3]);
-});
-
 await runTest('setIntersectSize should return count of common elements', () => {
   const a = new Set([1, 2, 3]);
   const b = [2, 3, 4];
   assert.equal(setIntersectSize(a, b), 2);
-});
-
-await runTest('setDifference should return elements in a but not in b', () => {
-  const a = new Set([1, 2, 3]);
-  const b = [2, 3];
-  const result = setDifference(a, b);
-  assert.deepEqual([...result], [1]);
 });
 
 await runTest('setPeek should return first element of set', () => {
@@ -301,7 +328,7 @@ await runTest('memoize should cache multiple argument results', () => {
 });
 
 // ============================================================================
-// isIterable / isPlainObject
+// isIterable
 // ============================================================================
 
 await runTest('isIterable should return true for arrays', () => {
@@ -318,19 +345,6 @@ await runTest('isIterable should return false for numbers', () => {
 
 await runTest('isIterable should return falsy for null', () => {
   assert.ok(!isIterable(null));
-});
-
-await runTest('isPlainObject should return true for plain objects', () => {
-  assert.equal(isPlainObject({}), true);
-  assert.equal(isPlainObject({ a: 1 }), true);
-});
-
-await runTest('isPlainObject should return false for arrays', () => {
-  assert.equal(isPlainObject([]), false);
-});
-
-await runTest('isPlainObject should return falsy for null', () => {
-  assert.ok(!isPlainObject(null));
 });
 
 // ============================================================================
@@ -543,6 +557,153 @@ await runTest('BitSet.allocatePool should create pool of sets', () => {
   bitsets[0].add(5);
   assert.equal(bitsets[0].has(5), true);
   assert.equal(bitsets[1].has(5), false);
+});
+
+await runTest('insertionSortInts sorts ascending and returns the same array', () => {
+  const values = [5, 1, 4, 1, 3];
+  const result = insertionSortInts(values);
+  assert.deepEqual(values, [1, 1, 3, 4, 5]);
+  assert.equal(result, values, 'must sort in place, not copy');
+});
+
+await runTest('insertionSortInts leaves ordered input untouched', () => {
+  for (const input of [[], [7], [1, 2], [0, 0, 1, 9]]) {
+    assert.deepEqual(insertionSortInts(input.slice()), input);
+  }
+});
+
+await runTest('insertionSortInts sorts a typed array numerically', () => {
+  // Array.prototype.sort with no comparator would order these lexicographically
+  // (1, 10, 2); a numeric sort must not.
+  const values = Uint16Array.from([10, 2, 1]);
+  insertionSortInts(values);
+  assert.deepEqual(Array.from(values), [1, 2, 10]);
+});
+
+await runTest('insertionSortInts matches a numeric sort on random input', () => {
+  let seed = 7;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+  for (let t = 0; t < 2000; t++) {
+    const values = [];
+    for (let i = 0, n = rnd(12); i < n; i++) values.push(rnd(50));
+    const expected = values.slice().sort((a, b) => a - b);
+    assert.deepEqual(insertionSortInts(values.slice()), expected);
+  }
+});
+
+await runTest('insertionSortInts orders by keys when given', () => {
+  // Values are cell ids; keys are scores looked up by cell id.
+  const scores = [0, 50, 10, 99, 20];
+  const values = [1, 2, 3, 4];
+  insertionSortInts(values, scores);
+  // scores: 1->50, 2->10, 3->99, 4->20  =>  2, 4, 1, 3
+  assert.deepEqual(values, [2, 4, 1, 3]);
+});
+
+await runTest('insertionSortInts keyed mode is stable on tied keys', () => {
+  const scores = [0, 5, 5, 5];
+  const values = [3, 1, 2];
+  insertionSortInts(values, scores);
+  // All keys tie, so the original order must survive.
+  assert.deepEqual(values, [3, 1, 2]);
+});
+
+await runTest('insertionSortInts keyed mode matches a sort by the same key', () => {
+  let seed = 11;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+  const scores = new Float64Array(40);
+  for (let i = 0; i < 40; i++) scores[i] = rnd(5);
+  for (let t = 0; t < 2000; t++) {
+    const values = [];
+    for (let i = 0, n = rnd(10); i < n; i++) values.push(rnd(40));
+    const expected = values.slice().sort((a, b) => scores[a] - scores[b]);
+    assert.deepEqual(insertionSortInts(values.slice(), scores), expected);
+  }
+});
+
+await runTest('BitSet.addAll should set every listed bit', () => {
+  const bs = new BitSet(128);
+  bs.addAll([0, 31, 32, 127]);
+  assert.deepEqual(bs.toSortedArray(), [0, 31, 32, 127]);
+
+  // Adding again is a no-op, and existing bits are kept.
+  bs.addAll([31, 64]);
+  assert.deepEqual(bs.toSortedArray(), [0, 31, 32, 64, 127]);
+
+  bs.addAll([]);
+  assert.deepEqual(bs.toSortedArray(), [0, 31, 32, 64, 127]);
+});
+
+await runTest('BitSet.addAll should accept a typed array', () => {
+  const bs = new BitSet(64);
+  bs.addAll(Uint16Array.from([3, 40]));
+  assert.deepEqual(bs.toSortedArray(), [3, 40]);
+});
+
+await runTest('BitSet.removeAll should clear every listed bit', () => {
+  const bs = new BitSet(128);
+  bs.addAll([0, 31, 32, 64, 127]);
+
+  bs.removeAll([31, 64]);
+  assert.deepEqual(bs.toSortedArray(), [0, 32, 127]);
+
+  // Removing an absent bit is a no-op.
+  bs.removeAll([31]);
+  assert.deepEqual(bs.toSortedArray(), [0, 32, 127]);
+
+  bs.removeAll(Uint16Array.from([0, 127]));
+  assert.deepEqual(bs.toSortedArray(), [32]);
+});
+
+await runTest('BitSet.subtract should remove the other set\'s bits', () => {
+  const a = new BitSet(64);
+  for (const b of [1, 2, 40]) a.add(b);
+
+  const b = new BitSet(64);
+  for (const x of [2, 40, 63]) b.add(x);
+
+  a.subtract(b);
+  // Bits only in `a` survive; shared bits go; bits only in `b` are not added.
+  assert.deepEqual(a.toSortedArray(), [1]);
+  // `b` is untouched.
+  assert.deepEqual(b.toSortedArray(), [2, 40, 63]);
+});
+
+await runTest('BitSet.count should count set bits', () => {
+  const bs = new BitSet(96);
+  assert.equal(bs.count(), 0);
+
+  // Spread across words, including the highest bit of a word.
+  bs.add(0);
+  bs.add(31);
+  bs.add(32);
+  bs.add(95);
+  assert.equal(bs.count(), 4);
+
+  // Adding an existing bit does not change the count.
+  bs.add(31);
+  assert.equal(bs.count(), 4);
+
+  bs.remove(31);
+  assert.equal(bs.count(), 3);
+});
+
+await runTest('BitSet.toSortedArray should return bits in ascending order', () => {
+  const bs = new BitSet(96);
+  assert.deepEqual(bs.toSortedArray(), []);
+
+  // Add out of order, and across word boundaries.
+  for (const b of [95, 32, 0, 31, 64]) bs.add(b);
+  assert.deepEqual(bs.toSortedArray(), [0, 31, 32, 64, 95]);
+});
+
+await runTest('BitSet.toSortedArray length should agree with count', () => {
+  const bs = new BitSet(64);
+  for (const b of [2, 9, 40]) bs.add(b);
+
+  // A count() that under-reports would still produce the right values (the
+  // array grows past its preallocated length), so check the length too.
+  assert.equal(bs.toSortedArray().length, bs.count());
 });
 
 await runTest('BitSet.clone should copy bits', () => {
@@ -798,44 +959,6 @@ await runTest('Timer.unpause when already running is safe', () => {
   timer.unpause(); // Already running, should be a no-op.
   timer.pause();
   assert.ok(timer.elapsedMs() >= 0);
-});
-
-// ============================================================================
-// IteratorWithCount
-// ============================================================================
-
-await runTest('IteratorWithCount counts iterations', () => {
-  const arr = [10, 20, 30];
-  const iter = new IteratorWithCount(arr[Symbol.iterator]());
-  assert.equal(iter.count, 0);
-
-  iter.next();
-  assert.equal(iter.count, 1);
-
-  iter.next();
-  assert.equal(iter.count, 2);
-
-  iter.next();
-  assert.equal(iter.count, 3);
-});
-
-await runTest('IteratorWithCount works in for-of loop', () => {
-  const arr = [1, 2, 3, 4, 5];
-  const iter = new IteratorWithCount(arr[Symbol.iterator]());
-  const collected = [];
-  for (const v of iter) {
-    collected.push(v);
-  }
-  assert.deepEqual(collected, [1, 2, 3, 4, 5]);
-  // Count includes the final done=true call.
-  assert.equal(iter.count, 6);
-});
-
-await runTest('IteratorWithCount with empty iterator', () => {
-  const iter = new IteratorWithCount([][Symbol.iterator]());
-  const result = iter.next();
-  assert.equal(result.done, true);
-  assert.equal(iter.count, 1);
 });
 
 await runTest('setSvgAttrs sets each attribute', () => {

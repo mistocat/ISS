@@ -3,7 +3,6 @@
 const {
   Timer,
   arraysAreEqual,
-  setIntersectionToArray,
   BitSet,
   setPeek
 } = await import('../util.js' + self.VERSION_PARAM);
@@ -380,25 +379,31 @@ class InternalSolver {
     // depend on the input order.
     // TODO: Do this in a more principled way. Consider doing this
     //       twice - once now and once after the optimizer runs.
-    handlers.sort((a, b) => {
+    // Read the sort keys out first: handlers of many different classes reach
+    // the comparator, making every property load on them megamorphic.
+    const keyed = handlers.map((h) => ({
+      handler: h,
+      numCells: h.cells.length,
+      name: h.constructor.name,
+      cells: h.cells.join(','),
+    }));
+    keyed.sort((a, b) => {
       // Put the handlers with the least cells first.
       // This just worked out better.
       // Most puzzles don't seem to depend too much on this order, but
       // it makes a 2x difference for some.
-      if (a.cells.length !== b.cells.length) {
-        return a.cells.length - b.cells.length;
+      if (a.numCells !== b.numCells) {
+        return a.numCells - b.numCells;
       }
       // After this it doesn't matter, as long as it is deterministic.
       // There still might be equal handlers after comparing cells and
       // the handler type, but that is ok.
-      if (a.constructor.name !== b.constructor.name) {
-        return a.constructor.name.localeCompare(b.constructor.name);
+      if (a.name !== b.name) {
+        return a.name.localeCompare(b.name);
       }
-      // Put cell comparison last as it is the most expensive.
-      const aCells = a.cells.join(',');
-      const bCells = b.cells.join(',');
-      return aCells.localeCompare(bCells);
+      return a.cells.localeCompare(b.cells);
     });
+    for (let i = 0; i < keyed.length; i++) handlers[i] = keyed[i].handler;
 
     const handlerSet = new HandlerSet(handlers, this._numSearchCells);
 
@@ -1266,11 +1271,12 @@ class PropagationQueue {
 export class CellExclusions {
   constructor(handlerSet, numSearchCells) {
     this._numSearchCells = numSearchCells;
+    // One bitset of excluded cells per cell, over a single backing buffer so
+    // that clone() is a typed-array copy.
+    ({ bitsets: this._exclusions, words: this._exclusionWords } =
+      BitSet.allocatePool(numSearchCells, numSearchCells));
     if (handlerSet !== null) {
-      this._cellExclusionSets = this.constructor._makeCellExclusionSets(
-        handlerSet, numSearchCells);
-    } else {
-      this._cellExclusionSets = [];
+      this._addHandlerExclusions(handlerSet);
     }
 
     this._cellExclusionArrays = [];
@@ -1290,37 +1296,34 @@ export class CellExclusions {
 
   clone() {
     const clone = new CellExclusions(null, this._numSearchCells);
-    clone._cellExclusionSets = this._cellExclusionSets.map(s => new Set(s));
+    clone._exclusionWords.set(this._exclusionWords);
     clone._sealed = this._sealed;
     return clone;
   }
 
-  static _makeCellExclusionSets(handlerSet, numSearchCells) {
-    const cellExclusionSets = [];
-    for (let i = 0; i < numSearchCells; i++) {
-      cellExclusionSets.push(new Set());
-    }
-
+  _addHandlerExclusions(handlerSet) {
+    const group = new BitSet(this._numSearchCells);
     for (const h of handlerSet) {
       const exclusionCells = h.exclusionCells();
+      if (exclusionCells.length === 0) continue;
+
+      // Union the whole group into each member at once, rather than walking
+      // every pair. A cell never excludes itself.
+      group.clear();
+      for (const c of exclusionCells) group.add(c);
       for (const c of exclusionCells) {
-        for (const d of exclusionCells) {
-          if (c === d) break;
-          cellExclusionSets[c].add(d);
-          cellExclusionSets[d].add(c);
-        }
+        this._exclusions[c].union(group);
+        this._exclusions[c].remove(c);
       }
     }
-
-    return cellExclusionSets;
   }
 
   addMutualExclusion(cell1, cell2) {
     if (this._sealed) {
       throw new Error('Cannot add exclusions after caching.');
     }
-    this._cellExclusionSets[cell1].add(cell2);
-    this._cellExclusionSets[cell2].add(cell1);
+    this._exclusions[cell1].add(cell2);
+    this._exclusions[cell2].add(cell1);
   }
 
   // Assume cell0 and cell1 are the same value, and hence can share exclusions.
@@ -1329,22 +1332,19 @@ export class CellExclusions {
     if (this._sealed) {
       throw new Error('Cannot add exclusions after caching.');
     }
-    for (const c of this._cellExclusionSets[cell0]) {
-      this._cellExclusionSets[cell1].add(c);
-    }
-    for (const c of this._cellExclusionSets[cell1]) {
-      this._cellExclusionSets[cell0].add(c);
-    }
+    // Both end up holding the union, matching the original pairwise copy.
+    this._exclusions[cell1].union(this._exclusions[cell0]);
+    this._exclusions[cell0].union(this._exclusions[cell1]);
   }
 
   isMutuallyExclusive(cell1, cell2) {
-    return this._cellExclusionSets[cell1].has(cell2);
+    return this._exclusions[cell1].has(cell2);
   }
 
   areMutuallyExclusive(cells) {
     const numCells = cells.length;
     for (let i = 0; i < numCells; i++) {
-      const iSet = this._cellExclusionSets[cells[i]];
+      const iSet = this._exclusions[cells[i]];
       for (let j = i + 1; j < numCells; j++) {
         if (!iSet.has(cells[j])) return false;
       }
@@ -1356,28 +1356,16 @@ export class CellExclusions {
     if (this._cellExclusionArrays.length === 0) {
       this._sealed = true;
       // Store an array version for fast iteration.
-      // Sort the cells so they are in predictable order.
-      this._cellExclusionArrays = (
-        this._cellExclusionSets.map(c => [...c]));
-      this._cellExclusionArrays.forEach(c => c.sort((a, b) => a - b));
+      this._cellExclusionArrays = this._exclusions.map(b => b.toSortedArray());
     }
 
     return this._cellExclusionArrays[cell];
   }
 
+  // The returned BitSet is the live exclusion set: callers must not modify it.
   getBitSet(cell) {
-    if (!this._cellExclusionBitSets) {
-      this._sealed = true;
-      this._cellExclusionBitSets = new Array(this._cellExclusionSets.length);
-    }
-    if (!this._cellExclusionBitSets[cell]) {
-      const bitSet = new BitSet(this._cellExclusionSets.length);
-      for (const c of this._cellExclusionSets[cell]) {
-        bitSet.add(c);
-      }
-      this._cellExclusionBitSets[cell] = bitSet;
-    }
-    return this._cellExclusionBitSets[cell];
+    this._sealed = true;
+    return this._exclusions[cell];
   }
 
   getPairExclusions(pairIndex) {
@@ -1407,14 +1395,12 @@ export class CellExclusions {
     const numCells = cells.length;
 
     // Find the intersection of all exclusions.
-    let allCellExclusions = [...this._cellExclusionSets[cells[0]]];
-    for (let i = 1; i < numCells && allCellExclusions.length; i++) {
-      allCellExclusions = setIntersectionToArray(
-        this._cellExclusionSets[cells[i]], allCellExclusions);
+    const allCellExclusions = this._exclusions[cells[0]].clone();
+    for (let i = 1; i < numCells; i++) {
+      allCellExclusions.intersect(this._exclusions[cells[i]]);
     }
 
-    allCellExclusions.sort((a, b) => a - b);
-    return allCellExclusions;
+    return allCellExclusions.toSortedArray();
   }
 
   _computePairExclusions(cell0, cell1) {
@@ -1425,11 +1411,9 @@ export class CellExclusions {
     }
 
     // Otherwise, calculate the intersection.
-    const result = setIntersectionToArray(
-      this._cellExclusionSets[cell0],
-      this._cellExclusionSets[cell1]);
-    result.sort((a, b) => a - b);
-    return result;
+    const result = this._exclusions[cell0].clone();
+    result.intersect(this._exclusions[cell1]);
+    return result.toSortedArray();
   }
 
   // Total number of cells involved in the search (grid cells + var cells).
@@ -1498,6 +1482,7 @@ class GridStateAllocator {
 
 export class HandlerSet {
   constructor(handlers, numSearchCells) {
+    this._numSearchCells = numSearchCells;
     this._allHandlers = [];
     this._seen = new Map();
     this._ordinaryIndexLookup = new Map();
@@ -1542,14 +1527,24 @@ export class HandlerSet {
     return this._auxHandlerMap;
   }
 
+  // A BitSet of handler indexes, with capacity numHandlers().
   getIntersectingIndexes(handler) {
-    const handlerIndex = this._ordinaryIndexLookup.get(handler);
-    const intersectingHandlers = new Set();
-    for (const c of handler.cells) {
-      this._ordinaryHandlerMap[c].forEach(i => intersectingHandlers.add(i));
+    const intersectingHandlers = new BitSet(this.numHandlers());
+    const cells = handler.cells;
+    for (let i = 0; i < cells.length; i++) {
+      intersectingHandlers.addAll(this._ordinaryHandlerMap[cells[i]]);
     }
-    intersectingHandlers.delete(handlerIndex);
+    intersectingHandlers.remove(this._ordinaryIndexLookup.get(handler));
     return intersectingHandlers;
+  }
+
+  numHandlers() {
+    return this._allHandlers.length;
+  }
+
+  // Grid cells + var cells: the capacity for a BitSet of cells.
+  numSearchCells() {
+    return this._numSearchCells;
   }
 
   getIndex(handler) {
@@ -1640,14 +1635,37 @@ export class HandlerSet {
   //   true if we added it to see.
   //   false if it already existed.
   _addToSeen(h) {
-    if (this._seen.has(h.idStr)) {
-      // Make sure we mark the handler as essential if either
-      // is essential.
-      this._seen.get(h.idStr).essential ||= h.essential;
-      return false;
+    if (!h.constructor.DEDUPES) return true;
+
+    const hash = HandlerSet._cellsHash(h.cells);
+    const bucket = this._seen.get(hash);
+    if (bucket === undefined) {
+      this._seen.set(hash, [h]);
+      return true;
     }
-    this._seen.set(h.idStr, h);
+
+    // Duplicates share their cells, so they always reach here.
+    const id = h.dedupId();
+    for (const other of bucket) {
+      if (other.dedupId() === id) {
+        // Make sure we mark the handler as essential if either
+        // is essential.
+        other.essential ||= h.essential;
+        return false;
+      }
+    }
+    bucket.push(h);
     return true;
+  }
+
+
+  static _cellsHash(cells) {
+    // Seeded with the length so that a leading cell 0 still contributes.
+    let hash = cells.length;
+    for (let i = 0; i < cells.length; i++) {
+      hash = ((hash << 7) | (hash >>> 25)) ^ cells[i];
+    }
+    return hash;
   }
 
   _addAux(handler) {

@@ -1,15 +1,13 @@
 const {
   memoize,
-  arrayIntersectSize,
   arrayDifference,
   setIntersectSize,
   arrayIntersect,
   arrayRemoveValue,
-  setIntersectionToArray,
-  setDifference,
   BitSet,
   elementarySymmetricSum,
   mergeSortedArrays,
+  sortedArrayCopy,
   countOnes16bit
 } = await import('../util.js' + self.VERSION_PARAM);
 const { LookupTables } = await import('./lookup_tables.js' + self.VERSION_PARAM);
@@ -114,8 +112,9 @@ export class SudokuConstraintOptimizer {
 
     for (const handler of handlerSet) {
       const priority = handler.priority(geometry);
-      for (const cell of handler.cells) {
-        priorities[cell] += priority;
+      const cells = handler.cells;
+      for (let i = 0; i < cells.length; i++) {
+        priorities[cells[i]] += priority;
       }
     }
 
@@ -154,9 +153,11 @@ export class SudokuConstraintOptimizer {
       if (priority < minLinkedPriority) continue;
 
       mark++;
-      for (const cell of handler.cells) marks[cell] = mark;
+      const cells = handler.cells;
+      for (let i = 0; i < cells.length; i++) marks[cells[i]] = mark;
 
-      for (const cell of handler.cells) {
+      for (let i = 0; i < cells.length; i++) {
+        const cell = cells[i];
         const linkedCell = linkedCells[cell];
         if (linkedCell === NO_LINKED_CELL || cell > linkedCell) continue;
         if (marks[linkedCell] !== mark) continue;
@@ -280,6 +281,7 @@ export class SudokuConstraintOptimizer {
     const binaryHandlers = [
       ...handlerSet.getAllofType(HandlerModule.BinaryConstraint),
       ...handlerSet.getAllofType(HandlerModule.BinaryPairwise)];
+    const graph = geometry.cellGraph();
     const links = [];
     for (const handler of binaryHandlers) {
       if (handler.key() !== equalsKey) continue;
@@ -292,11 +294,7 @@ export class SudokuConstraintOptimizer {
           const regionCellB = cells[j];
           if (regionCellB < regionCellOffset || regionCellB >= regionCellLimit) continue;
           const cellB = regionCellB - regionCellOffset;
-          const delta = Math.abs(cellA - cellB);
-          if (delta === geometry.numCols
-            || (delta === 1 && (cellA / geometry.numCols | 0) === (cellB / geometry.numCols | 0))) {
-            links.push([cellA, cellB]);
-          }
+          if (graph.cellEdges(cellA).includes(cellB)) links.push([cellA, cellB]);
         }
       }
     }
@@ -369,8 +367,7 @@ export class SudokuConstraintOptimizer {
   // the count is a sound lower bound on the number of forced coincidences (hence
   // on the reduction in distinct labels).
   _countEnclosedRegionCoincidences(countedGridCells, geometry) {
-    const neighborTable = ConnectedHandlerModule.neighborTable(
-      geometry.numRows, geometry.numCols);
+    const neighborTable = ConnectedHandlerModule.neighborTable(geometry);
     const used = new Set();
     let reduction = 0;
 
@@ -495,15 +492,25 @@ export class SudokuConstraintOptimizer {
         h => h.cells.length === boxSize);
 
     const numHandlers = allHandlers.length;
+
+    // Every house is tested against every other, so hold them as bitsets.
+    const { bitsets: houseCells } = BitSet.allocatePool(
+      geometry.totalCells(), numHandlers);
+    for (let i = 0; i < numHandlers; i++) {
+      houseCells[i].addAll(allHandlers[i].cells);
+    }
+
     for (let i = 1; i < numHandlers; i++) {
       for (let j = 0; j < i; j++) {
         if (allHandlers[i].valueMask() !== allHandlers[j].valueMask()) continue;
-        const intersectionSize = arrayIntersectSize(
-          allHandlers[i].cells, allHandlers[j].cells);
+        const intersectionSize = houseCells[i].intersectCount(houseCells[j]);
         if (intersectionSize !== boxWidth && intersectionSize !== boxHeight) continue;
+        const onlyInI = houseCells[i].clone();
+        onlyInI.subtract(houseCells[j]);
+        const onlyInJ = houseCells[j].clone();
+        onlyInJ.subtract(houseCells[i]);
         const newHandler = new HandlerModule.SameValuesIgnoreCount(
-          arrayDifference(allHandlers[i].cells, allHandlers[j].cells),
-          arrayDifference(allHandlers[j].cells, allHandlers[i].cells));
+          onlyInI.toSortedArray(), onlyInJ.toSortedArray());
         handlerSet.addAux(newHandler);
         this._logAddHandler(
           '_addGridHouseIntersections', newHandler, { aux: true });
@@ -524,15 +531,21 @@ export class SudokuConstraintOptimizer {
   }
 
   // Find a non-overlapping set of handlers.
-  _findNonOverlappingSubset(handlers, fullHandlerSet) {
-    const handlerIndexes = new Set(
-      handlers.map(h => fullHandlerSet.getIndex(h)));
+  // `intersectionCache` is an optional Map for reusing getIntersectingIndexes
+  // results across calls -- see the caller for when that is valid.
+  _findNonOverlappingSubset(handlers, fullHandlerSet, intersectionCache = null) {
+    const handlerIndexes = new BitSet(fullHandlerSet.numHandlers());
+    for (const h of handlers) handlerIndexes.add(fullHandlerSet.getIndex(h));
 
     // Sort handers by number of overlapping handlers.
     const handlersByOverlaps = [];
     for (const h of handlers) {
-      const overlapIndexes = fullHandlerSet.getIntersectingIndexes(h);
-      const numOverlap = setIntersectSize(overlapIndexes, handlerIndexes);
+      let overlapIndexes = intersectionCache?.get(h);
+      if (overlapIndexes === undefined) {
+        overlapIndexes = fullHandlerSet.getIntersectingIndexes(h);
+        intersectionCache?.set(h, overlapIndexes);
+      }
+      const numOverlap = overlapIndexes.intersectCount(handlerIndexes);
       handlersByOverlaps.push([h, numOverlap]);
     }
     handlersByOverlaps.sort((a, b) => a[1] - b[1]);
@@ -541,7 +554,7 @@ export class SudokuConstraintOptimizer {
     // Start with the handlers with the least overlaps as they restrict future
     // choices the least.
     // i.e. greedy bin-packing.
-    const cellsIncluded = new Set();
+    const cellsIncluded = new BitSet(fullHandlerSet.numSearchCells());
     const nonOverlappingHandlers = [];
     for (const [h,] of handlersByOverlaps) {
       if (h.cells.some(c => cellsIncluded.has(c))) continue;
@@ -549,7 +562,7 @@ export class SudokuConstraintOptimizer {
       h.cells.forEach(c => cellsIncluded.add(c));
     }
 
-    return [nonOverlappingHandlers, cellsIncluded];
+    return nonOverlappingHandlers;
   }
 
   _optimizeSums(handlerSet, cellExclusions, boxRegions, geometry, effectiveValueInfo) {
@@ -563,11 +576,11 @@ export class SudokuConstraintOptimizer {
     const safeSumHandlers = allSumHandlers.filter(
       h => h.onlyUnitCoeffs() && h.cells.length > 0);
 
-    const [filteredSumHandlers, sumCells] =
+    const filteredSumHandlers =
       this._findNonOverlappingSubset(safeSumHandlers, handlerSet);
 
     handlerSet.addNonEssential(
-      ...this._fillInSumGap(filteredSumHandlers, sumCells, geometry));
+      ...this._fillInSumGap(filteredSumHandlers, geometry));
 
     handlerSet.addNonEssential(
       ...this._makeInnieOutieSumHandlers(
@@ -684,8 +697,7 @@ export class SudokuConstraintOptimizer {
     };
 
     for (const h of allSumHandlers) {
-      const cells = [...h.cells];
-      cells.sort((a, b) => a - b);
+      const cells = sortedArrayCopy(h.cells);
 
       const r = recordFromCellsAndSum(cells, h.sum(), true);
       if (!r) continue;
@@ -807,7 +819,7 @@ export class SudokuConstraintOptimizer {
     }
   }
 
-  _fillInSumGap(sumHandlers, sumCells, geometry) {
+  _fillInSumGap(sumHandlers, geometry) {
     // The grid total is only known when the rows are Sudoku houses.
     if (geometry.gridType !== CellGeometry.SUDOKU_GRID_TYPE) return [];
     // Fill in a gap if one remains.
@@ -830,7 +842,6 @@ export class SudokuConstraintOptimizer {
       [...remainingCells], remainingSum);
 
     sumHandlers.push(newHandler);
-    remainingCells.forEach(c => sumCells.add(c));
 
     if (this._debugLogger) {
       this._logAddHandler('_fillInSumGap', newHandler, {
@@ -964,47 +975,51 @@ export class SudokuConstraintOptimizer {
   _addSumIntersectionHandler(
     baseRegion, intersectingSumHandlers, gapRegions,
     removableRegionsBySize, cellExclusions, geometry) {
+    const numSearchCells = cellExclusions.numSearchCells();
     let totalSum = 0;
-    let candidateCells = new Set();
-    let uncoveredBaseCells = new Set(baseRegion.cells);
+    const candidateCells = new BitSet(numSearchCells);
+    const baseCells = new BitSet(numSearchCells);
+    baseCells.addAll(baseRegion.cells);
     for (const h of intersectingSumHandlers) {
       totalSum += h.sum();
-      h.cells.forEach(c => candidateCells.add(c));
-      h.cells.forEach(c => uncoveredBaseCells.delete(c));
+      candidateCells.addAll(h.cells);
     }
+    // Invariant from here: uncoveredBaseCells == baseCells - candidateCells.
+    const uncoveredBaseCells = baseCells.clone();
+    uncoveredBaseCells.subtract(candidateCells);
 
     // If we haven't filled up the entire region then try to greedily fill the
     // holes with intersecting all-different regions.
     let usedExtraRegions = false;
-    if (uncoveredBaseCells.size > 0) {
+    if (!uncoveredBaseCells.isEmpty()) {
       for (const gapRegion of gapRegions) {
         // Ignore any regions which intersect with the existing cells.
-        if (setIntersectSize(candidateCells, gapRegion.cells) > 0) continue;
+        if (candidateCells.hasIntersection(gapRegion.cellsBitSet)) continue;
         // Ignore any regions which don't cover the uncovered cells.
-        const intersectSize = setIntersectSize(uncoveredBaseCells, gapRegion.cells);
+        const intersectSize = uncoveredBaseCells.intersectCount(gapRegion.cellsBitSet);
         if (intersectSize === 0) continue;
         // Ignore handlers which only intersect in one square. This is likely
         // a row crossing a column, and is generally not useful.
         if (intersectSize === 1) continue;
         // Ensure the intersection only covers the uncovered cells.
-        if (intersectSize !== arrayIntersectSize(baseRegion.cells, gapRegion.cells)) {
+        if (intersectSize !== baseCells.intersectCount(gapRegion.cellsBitSet)) {
           continue;
         }
         // This handler fills in an existing gap.
         totalSum += gapRegion.sum;
-        gapRegion.cells.forEach(c => candidateCells.add(c));
-        gapRegion.cells.forEach(c => uncoveredBaseCells.delete(c));
+        candidateCells.addAll(gapRegion.cells);
+        uncoveredBaseCells.subtract(candidateCells);
         usedExtraRegions = true;
-        if (uncoveredBaseCells.size === 0) break;
+        if (uncoveredBaseCells.isEmpty()) break;
       }
     }
 
     // If we still haven't covered all the cells, then give up.
-    if (uncoveredBaseCells.size > 0) return null;
+    if (!uncoveredBaseCells.isEmpty()) return null;
 
     // Remove the current region cells, as we care about the cells outside the
     // region.
-    baseRegion.cells.forEach(c => candidateCells.delete(c));
+    candidateCells.subtract(baseCells);
     totalSum -= baseRegion.sum;
 
     // While it's possible that there could be another region completely
@@ -1012,28 +1027,29 @@ export class SudokuConstraintOptimizer {
     // Note that regions used to construct the cells won't match as we have
     // already removed the cells in the current region.
     let removedExtraRegions = false;
+    let candidateCount = candidateCells.count();
     for (const region of removableRegionsBySize) {
       // Regions are sorted by increasing cellCount; once one region is larger
       // than candidateCells, all remaining regions are also too large.
-      if (region.cellCount > candidateCells.size) break;
+      if (region.cellCount > candidateCount) break;
       // Ignore any regions which don't cover the cells.
-      const intersectSize = setIntersectSize(candidateCells, region.cells);
+      const intersectSize = candidateCells.intersectCount(region.cellsBitSet);
       if (intersectSize !== region.cellCount) continue;
       // This region is completely contained within the cells.
       totalSum -= region.sum;
-      region.cells.forEach(c => candidateCells.delete(c));
+      candidateCells.removeAll(region.cells);
+      candidateCount -= region.cellCount;
       removedExtraRegions = true;
-      if (candidateCells.size === 0) break;
+      if (candidateCount === 0) break;
     }
 
-    if (candidateCells.size === 0) return null;
+    if (candidateCount === 0) return null;
 
     // Use mutual-exclusion structure to estimate how restrictive this inferred
     // sum will be. Prefer sums that imply a narrow range relative to dof.
-    const cellsArray = [...candidateCells];
-    // Sort so that the result is deterministic, and also makes greedy grouping
-    // naturally align on rows.
-    cellsArray.sort((a, b) => a - b);
+    // Sorted, so that the result is deterministic, and so that greedy grouping
+    // naturally aligns on rows.
+    const cellsArray = candidateCells.toSortedArray();
     const groups = HandlerModule.HandlerUtil.findExclusionGroupsGreedy(
       cellsArray, cellExclusions).groups;
     const { range, min, max } = HandlerModule.HandlerUtil.exclusionGroupSumInfo(
@@ -1078,38 +1094,45 @@ export class SudokuConstraintOptimizer {
   _makeHiddenCageHandlers(handlerSet, allSumHandlers, cellExclusions, geometry) {
     const allDiffRegions = fixedSumRegions(
       handlerSet.getAllofType(HandlerModule.PerfectAllDifferent),
-      handlerSet, geometry);
+      handlerSet, geometry, cellExclusions.numSearchCells());
     const allDiffRegionsBySize = [...allDiffRegions].sort(
       (a, b) => a.cellCount - b.cellCount);
     const allDiffRegionByIndex = new Map(
       allDiffRegions.map(region => [region.handlerIndex, region]));
     const newHandlers = [];
 
-    const allSumHandlerIndexes = new Set(
-      allSumHandlers.map(h => handlerSet.getIndex(h)));
-    const allDiffHandlerIndexes = new Set(
-      allDiffRegions.map(region => region.handlerIndex));
+    const allSumHandlerIndexes = new BitSet(handlerSet.numHandlers());
+    for (const h of allSumHandlers) allSumHandlerIndexes.add(handlerSet.getIndex(h));
+    const allDiffHandlerIndexes = new BitSet(handlerSet.numHandlers());
+    for (const region of allDiffRegions) allDiffHandlerIndexes.add(region.handlerIndex);
+    // Reused across regions: each region is tested against every sum handler.
+    const regionCells = new BitSet(cellExclusions.numSearchCells());
+    // A handler's intersecting set depends on the handler, not the region, and
+    // regions revisit the same sum handlers. Scoped to this pass only: adding
+    // handlers changes the result, and the caller adds ours once we return.
+    const intersectionCache = new Map();
 
     for (const baseRegion of allDiffRegions) {
       const h = baseRegion.handler;
       // Find sum constraints which overlap this region.
-      let intersectingHandlers = handlerSet.getIntersectingIndexes(h);
-      const currentRegionSumIndexes = setIntersectionToArray(
-        intersectingHandlers, allSumHandlerIndexes);
-      if (currentRegionSumIndexes.length === 0) continue;
+      const intersectingHandlers = handlerSet.getIntersectingIndexes(h);
+      const currentRegionSumIndexes = intersectingHandlers.clone();
+      currentRegionSumIndexes.intersect(allSumHandlerIndexes);
+      if (currentRegionSumIndexes.isEmpty()) continue;
 
       // For the sum intersection, we need to ensure that the sum handlers don't
       // overlap themselves.
       // We do this separately for each region so that we don't have to force
       // the same handler to be used in every region it intersects.
-      const [filteredSumHandlers] = this._findNonOverlappingSubset(
-        currentRegionSumIndexes.map(i => handlerSet.getHandler(i)),
-        handlerSet);
+      const filteredSumHandlers = this._findNonOverlappingSubset(
+        currentRegionSumIndexes.toSortedArray().map(i => handlerSet.getHandler(i)),
+        handlerSet, intersectionCache);
 
       {
-        const intersectingAllDiffRegions = (
-          setIntersectionToArray(intersectingHandlers, allDiffHandlerIndexes)).map(
-            i => allDiffRegionByIndex.get(i));
+        const currentRegionDiffIndexes = intersectingHandlers.clone();
+        currentRegionDiffIndexes.intersect(allDiffHandlerIndexes);
+        const intersectingAllDiffRegions = currentRegionDiffIndexes.toSortedArray().map(
+          i => allDiffRegionByIndex.get(i));
         const sumIntersectionHandler = this._addSumIntersectionHandler(
           baseRegion, filteredSumHandlers, intersectingAllDiffRegions, allDiffRegionsBySize,
           cellExclusions, geometry);
@@ -1122,8 +1145,10 @@ export class SudokuConstraintOptimizer {
       // the region.
       const constrainedCells = [];
       let constrainedSum = 0;
+      regionCells.clear();
+      regionCells.addAll(h.cells);
       for (const k of filteredSumHandlers) {
-        const overlapSize = arrayIntersectSize(h.cells, k.cells);
+        const overlapSize = setIntersectSize(regionCells, k.cells);
         if (overlapSize === k.cells.length) {
           constrainedCells.push(...k.cells);
           constrainedSum += k.sum();
@@ -1191,7 +1216,7 @@ export class SudokuConstraintOptimizer {
   // fixed-value regions.
   _makeJigsawIntersections(handlerSet, jigsawPieces) {
     const allHandlers = handlerSet.getAllofType(HandlerModule.PerfectAllDifferent);
-    const cellsKey = (cells) => [...cells].sort((a, b) => a - b).join(',');
+    const cellsKey = (cells) => sortedArrayCopy(cells).join(',');
     const pieceKeys = new Set(jigsawPieces.map(p => cellsKey(p.cells)));
     const isPiece = allHandlers.map(h => pieceKeys.has(cellsKey(h.cells)));
     const newHandlers = [];
@@ -1284,12 +1309,14 @@ export class SudokuConstraintOptimizer {
     }
   }
 
-  _generalRegionOverlapProcessor(regions, pieces, callback) {
+  // `superRegion` and `piecesRegion` are passed to the callback as BitSets of
+  // cells, sized to numSearchCells.
+  _generalRegionOverlapProcessor(regions, pieces, numSearchCells, callback) {
     const numValues = regions.length;
-    const superRegion = new Set();
+    const superRegion = new BitSet(numSearchCells);
     const remainingPieces = new Set(pieces);
     const usedPieces = [];
-    const piecesRegion = new Set();
+    const piecesRegion = new BitSet(numSearchCells);
 
     let i = 0;
     for (const r of regions) {
@@ -1297,7 +1324,7 @@ export class SudokuConstraintOptimizer {
       if (i === numValues) break;
 
       // Add r to our super-region.
-      r.forEach(e => superRegion.add(e));
+      for (const c of r) superRegion.add(c);
 
       // Add any remaining pieces with enough overlap to our super-region.
       for (const p of remainingPieces) {
@@ -1324,23 +1351,28 @@ export class SudokuConstraintOptimizer {
 
     const handleOverlap = (superRegion, piecesRegion, usedPieces) => {
       // We can only match when regions are the same size.
-      if (superRegion.size !== piecesRegion.size) return;
+      if (superRegion.count() !== piecesRegion.count()) return;
 
-      const diffA = setDifference(superRegion, piecesRegion);
-      if (diffA.size === 0) return;
-      const diffB = setDifference(piecesRegion, superRegion);
+      const diffA = superRegion.clone();
+      diffA.subtract(piecesRegion);
+      const diffASize = diffA.count();
+      if (diffASize === 0) return;
+      const diffB = piecesRegion.clone();
+      diffB.subtract(superRegion);
       // Ignore diff that too big, they are probably not very well
       // constrained.
-      if (diffA.size >= geometry.numValues) return;
+      if (diffASize >= geometry.numValues) return;
 
       // All values in the set differences must be the same.
-      const newHandler = new HandlerModule.SameValuesIgnoreCount(diffA, diffB);
+      const newHandler = new HandlerModule.SameValuesIgnoreCount(
+        diffA.toSortedArray(), diffB.toSortedArray());
       newHandlers.push(newHandler);
       this._logAddHandler('_makeJigsawLawOfLeftoverHandlers', newHandler);
     }
 
     for (const r of this._overlapRegions(geometry, boxRegions, effectiveValueCount)) {
-      this._generalRegionOverlapProcessor(r, pieces, handleOverlap);
+      this._generalRegionOverlapProcessor(
+        r, pieces, geometry.totalCells(), handleOverlap);
     }
 
     return newHandlers;
@@ -1354,55 +1386,54 @@ export class SudokuConstraintOptimizer {
     const pieces = sumHandlers.map(h => h.cells);
     const piecesMap = new Map(sumHandlers.map(h => [h.cells, h.sum()]));
 
-    const cellsInSum = new Set();
-    sumHandlers.forEach(h => h.cells.forEach(c => cellsInSum.add(c)));
-    const hasCellsWithoutSum = (cells) => {
-      for (const c of cells) {
-        if (!cellsInSum.has(c)) return true;
-      }
-      return false;
-    };
+    const cellsInSum = new BitSet(geometry.totalCells());
+    for (const h of sumHandlers) cellsInSum.addAll(h.cells);
 
     const handleOverlap = (superRegion, piecesRegion, usedPieces) => {
-      let diffA = setDifference(superRegion, piecesRegion);
-      let diffB = setDifference(piecesRegion, superRegion);
+      let diffA = superRegion.clone();
+      diffA.subtract(piecesRegion);
+      let diffB = piecesRegion.clone();
+      diffB.subtract(superRegion);
+      let sizeA = diffA.count();
+      let sizeB = diffB.count();
 
       // No diff, no new constraints to add.
-      if (diffA.size === 0 && diffB.size === 0) return;
+      if (sizeA === 0 && sizeB === 0) return;
       // Don't use this if the diff is too large.
-      if (diffA.size + diffB.size > effectiveValueCount) return;
+      if (sizeA + sizeB > effectiveValueCount) return;
 
       // We can only do negative sum constraints when the diff is 1.
       // We can only do sum constraints when the diff is 0.
-      if (diffA.size > 2 && diffB.size > 2) return;
+      if (sizeA > 2 && sizeB > 2) return;
 
-      if (!(hasCellsWithoutSum(diffA) || hasCellsWithoutSum(diffB))) {
+      if (cellsInSum.hasAll(diffA) && cellsInSum.hasAll(diffB)) {
         // If all cells in the diff overlap with a piece, then limit the size of
         // the sum.
-        if (diffA.size + diffB.size > this._MAX_SUM_SIZE) return;
+        if (sizeA + sizeB > this._MAX_SUM_SIZE) return;
         // Otherwise we are adding a sum constraint to a cell which doesn't
         // currently have one, so we'll take all the help we can get!
       }
 
-      let sumDelta = -superRegion.size * effectiveValueSum / effectiveValueCount;
+      let sumDelta = -superRegion.count() * effectiveValueSum / effectiveValueCount;
       for (const p of usedPieces) sumDelta += piecesMap.get(p);
 
       // Ensure diffA is the smaller.
-      if (diffA.size > diffB.size) {
+      if (sizeA > sizeB) {
         [diffA, diffB] = [diffB, diffA];
+        [sizeA, sizeB] = [sizeB, sizeA];
         sumDelta = -sumDelta;
       }
 
       let newHandler;
       let args;
-      const sortedDiffB = [...diffB].sort((a, b) => a - b);
-      if (diffA.size === 0) {
+      const sortedDiffB = diffB.toSortedArray();
+      if (sizeA === 0) {
         newHandler = new SumHandlerModule.Sum(sortedDiffB, sumDelta);
         args = { sum: sumDelta };
       } else {
-        const sortedDiffA = [...diffA].sort((a, b) => a - b);
+        const sortedDiffA = diffA.toSortedArray();
         const newHandlerCells = [...sortedDiffB, ...sortedDiffA];
-        const coeffs = newHandlerCells.map((_, i) => i < diffB.size ? 1 : -1);
+        const coeffs = newHandlerCells.map((_, i) => i < sizeB ? 1 : -1);
         newHandler = new SumHandlerModule.Sum(
           newHandlerCells, sumDelta, coeffs);
         args = { sum: sumDelta, negativeCells: sortedDiffA };
@@ -1413,7 +1444,8 @@ export class SudokuConstraintOptimizer {
     };
 
     for (const r of this._overlapRegions(geometry, boxRegions, effectiveValueCount)) {
-      this._generalRegionOverlapProcessor(r, pieces, handleOverlap);
+      this._generalRegionOverlapProcessor(
+        r, pieces, geometry.totalCells(), handleOverlap);
     }
 
     return newHandlers;
@@ -1787,15 +1819,21 @@ const maxSumForValueCount = (valueCount, valueOffset) => (
 const maxSumForShape = (geometry) => (
   maxSumForValueCount(geometry.numValues, geometry.valueOffset));
 
-const fixedSumRegions = (handlers, handlerSet, geometry) => {
+const fixedSumRegions = (handlers, handlerSet, geometry, numSearchCells) => {
   const lookup = LookupTables.get(geometry.numValues);
-  return handlers.map(handler => {
+  // Each region is intersected with cell sets many times over, so keep its
+  // cells as a bitset too.
+  const { bitsets } = BitSet.allocatePool(numSearchCells, handlers.length);
+  return handlers.map((handler, i) => {
     const valueMask = handler.valueMask();
     const cellCount = handler.cells.length;
+    const cellsBitSet = bitsets[i];
+    cellsBitSet.addAll(handler.cells);
     return {
       handler,
       handlerIndex: handlerSet.getIndex(handler),
       cells: handler.cells,
+      cellsBitSet,
       cellCount,
       sum: lookup.sum[valueMask]
         + geometry.valueOffset * cellCount,

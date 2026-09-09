@@ -126,9 +126,38 @@ export const arrayIntersect = (a, b) => {
   return a.filter(v => b.includes(v));
 };
 
-export const arrayIntersectSize = (a, b) => {
-  return a.reduce((p, v) => p + b.includes(v), 0);
-}
+// Ascending copy of `values`, optionally with duplicates removed. Input is
+// usually already in order, so only sort when the scan finds a violation.
+export const sortedArrayCopy = (values, removeDuplicates = false) => {
+  const copy = [...values];
+  const minDelta = removeDuplicates ? 1 : 0;
+  for (let i = 1; i < copy.length; i++) {
+    if (copy[i] - copy[i - 1] < minDelta) {
+      const fixed = removeDuplicates ? Array.from(new Set(copy)) : copy;
+      fixed.sort((a, b) => a - b);
+      return fixed;
+    }
+  }
+  return copy;
+};
+
+// Sort an integer array (plain or typed) into ascending order, in place.
+// Given `keys`, values are ordered by `keys[value]` instead of by themselves.
+// Linear on already-ordered input and allocation-free (no comparator closure,
+// no buffer for Array.sort to work in), but quadratic on badly ordered input:
+// only for arrays known to be short.
+export const insertionSortInts = (values, keys = null) => {
+  for (let i = 1; i < values.length; i++) {
+    const value = values[i];
+    const key = keys === null ? value : keys[value];
+    let j = i - 1;
+    for (; j >= 0 && (keys === null ? values[j] : keys[values[j]]) > key; j--) {
+      values[j + 1] = values[j];
+    }
+    values[j + 1] = value;
+  }
+  return values;
+};
 
 // Merge two sorted, disjoint arrays.
 export const mergeSortedArrays = (a, b) => {
@@ -178,18 +207,7 @@ export const elementarySymmetricSum = (values, k) => {
   return dp[k];
 };
 
-// `a` must be a set, `b` must be iterable.
-export const setIntersectionToArray = (a, b) => {
-  const intersection = [];
-  for (const elem of b) {
-    if (a.has(elem)) {
-      intersection.push(elem)
-    }
-  }
-  return intersection;
-};
-
-// `a` must be a set, `b` must be iterable.
+// `a` must have a `has()` method (a Set or a BitSet), `b` must be iterable.
 export const setIntersectSize = (a, b) => {
   let count = 0;
   for (const elem of b) {
@@ -197,14 +215,6 @@ export const setIntersectSize = (a, b) => {
   }
   return count;
 }
-
-export const setDifference = (a, b) => {
-  const diff = new Set(a);
-  for (const elem of b) {
-    diff.delete(elem);
-  }
-  return diff;
-};
 
 export const setPeek = (a) => {
   for (const elem of a) {
@@ -299,20 +309,6 @@ export class Timer {
   }
 }
 
-export class IteratorWithCount {
-  constructor(iter) {
-    this._iter = iter;
-    this.count = 0;
-  }
-
-  next() {
-    this.count++;
-    return this._iter.next();
-  }
-
-  [Symbol.iterator] = () => this;
-}
-
 const makeDynamicLoader = (createElement) => {
   return (path) => {
     let loaded = false;
@@ -369,10 +365,6 @@ export const toggleDisabled = (element, disabled) => {
 
 export const isIterable = (obj) => {
   return obj && typeof obj[Symbol.iterator] === 'function';
-};
-
-export const isPlainObject = (obj) => {
-  return obj && obj.constructor === Object;
 };
 
 export const localTimestamp = () => {
@@ -664,10 +656,26 @@ export class BitSet {
     this.words[wordIndex] |= mask;
   }
 
+  addAll(bitIndexes) {
+    const words = this.words;
+    for (let i = 0; i < bitIndexes.length; i++) {
+      const bitIndex = bitIndexes[i];
+      words[bitIndex >>> 5] |= 1 << (bitIndex & 31);
+    }
+  }
+
   remove(bitIndex) {
     const wordIndex = bitIndex >>> 5;
     const mask = 1 << (bitIndex & 31);
     this.words[wordIndex] &= ~mask;
+  }
+
+  removeAll(bitIndexes) {
+    const words = this.words;
+    for (let i = 0; i < bitIndexes.length; i++) {
+      const bitIndex = bitIndexes[i];
+      words[bitIndex >>> 5] &= ~(1 << (bitIndex & 31));
+    }
   }
 
   has(bitIndex) {
@@ -706,6 +714,22 @@ export class BitSet {
     }
   }
 
+  count() {
+    let count = 0;
+    for (let i = 0; i < this.words.length; i++) {
+      count += countOnes32bit(this.words[i]);
+    }
+    return count;
+  }
+
+  toSortedArray() {
+    // Preallocating saves memory.
+    const result = new Array(this.count()).fill(0);
+    let i = 0;
+    this.forEachBit(b => { result[i++] = b; });
+    return result;
+  }
+
   intersect(other) {
     for (let i = 0; i < this.words.length; i++) {
       this.words[i] &= other.words[i];
@@ -718,6 +742,12 @@ export class BitSet {
       count += countOnes32bit(this.words[i] & other.words[i]);
     }
     return count;
+  }
+
+  subtract(other) {
+    for (let i = 0; i < this.words.length; i++) {
+      this.words[i] &= ~other.words[i];
+    }
   }
 
   hasIntersection(other) {
@@ -776,6 +806,10 @@ export class MultiMap {
 
   clear() {
     this._map.clear();
+  }
+
+  get size() {
+    return this._map.size;
   }
 
   getMap() {

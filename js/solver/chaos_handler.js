@@ -1,6 +1,6 @@
 const { LookupTables } = await import('./lookup_tables.js' + self.VERSION_PARAM);
 const { SudokuConstraintHandler, InvalidConstraintError } = await import('./handlers.js' + self.VERSION_PARAM);
-const { countOnes16bit } = await import('../util.js' + self.VERSION_PARAM);
+const { countOnes16bit, insertionSortInts } = await import('../util.js' + self.VERSION_PARAM);
 const { NO_CELL, neighborTable, enclosingNeighbors } = await import('./connected_handler.js' + self.VERSION_PARAM);
 
 const DEFER_CONNECTIVITY = 2;
@@ -10,9 +10,22 @@ const REGION_FIXED_COUNT_MASK = 0x1f;
 const REGION_VALUE_MASK_SHIFT = 14;
 const REGION_COUNT_MASK = (1 << REGION_VALUE_MASK_SHIFT) - 1;
 
-const cellsAreAdjacent = (cellA, cellB, numCols) => {
-  const delta = Math.abs(cellA - cellB);
-  return delta === numCols || (delta === 1 && (cellA / numCols | 0) === (cellB / numCols | 0));
+// ChaosArrow and ChaosCount relate a control cell to an internal run length or
+// count: internal = control value + offset.
+const toInternalMask = (controlMask, offset) =>
+  offset >= 0 ? controlMask << offset : controlMask >>> -offset;
+const toControlMask = (internalMask, offset) =>
+  offset >= 0 ? internalMask >>> offset : internalMask << -offset;
+
+// Restricts the control cell to internal values in [minInternal, maxInternal]
+// Returns false when the range leaves no candidates.
+const restrictControlRange = (
+  initialGridCells, controlCell, minInternal, maxInternal, offset) => {
+  const loBit = Math.max(0, minInternal - 1 - offset);
+  const hiBit = maxInternal - offset;
+  if (loBit >= hiBit) return false;
+  const rangeMask = (1 << hiBit) - (1 << loBit);
+  return !!(initialGridCells[controlCell] &= rangeMask);
 };
 
 // Union-find union: merges cellA and cellB's shards, keeping the smaller index as root.
@@ -42,12 +55,10 @@ class ChaosRegionShardState {
   }
 
   // Merge the shards of cellA and cellB, queuing their region cells if they changed.
-  merge(grid, cellA, cellB, pQueue = null) {
+  merge(grid, cellA, cellB, pQueue) {
     if (!unionShardRoots(grid, this._regionShardOffset, cellA, cellB)) return false;
-    if (pQueue) {
-      pQueue.addForCell(this._regionCellOffset + cellA);
-      pQueue.addForCell(this._regionCellOffset + cellB);
-    }
+    pQueue.addForCell(this._regionCellOffset + cellA);
+    pQueue.addForCell(this._regionCellOffset + cellB);
     return true;
   }
 
@@ -80,7 +91,6 @@ export class ChaosConstruction extends SudokuConstraintHandler {
     this._regionLinks = [];
     this._regionShardState = new ChaosRegionShardState();
     this._effectiveValueMask = -1;
-    this.idStr = [this.constructor.name, this._numGridCells].join('|');
   }
 
   setEffectiveValueMask(mask) {
@@ -104,7 +114,7 @@ export class ChaosConstruction extends SudokuConstraintHandler {
   _chooseCanonicalAnchors(geometry, cellPriorities) {
     if (this._numRegions < 3 || this._numGridCells < 3) return [0];
 
-    const { numRows, numCols, numValues } = geometry;
+    const { numRows, numCols } = geometry;
     const regionCellOffset = this._regionCellOffset;
     const anchorScore = cell => cellPriorities[cell] + cellPriorities[regionCellOffset + cell];
 
@@ -147,7 +157,7 @@ export class ChaosConstruction extends SudokuConstraintHandler {
     }
 
     if (!bestCells) return [0];
-    return bestCells.sort((a, b) => a - b);
+    return insertionSortInts(bestCells);
   }
 
   _configureShape(geometry) {
@@ -160,6 +170,12 @@ export class ChaosConstruction extends SudokuConstraintHandler {
     if (geometry.numGridCells % this._regionSize !== 0) {
       throw new InvalidConstraintError(
         'ChaosConstruction requires grid cell count to be divisible by region size.');
+    }
+    // A region is a house of regionSize distinct values. (This also keeps the
+    // packed per-region fixed count within its 5 bits.)
+    if (this._regionSize > geometry.numValues) {
+      throw new InvalidConstraintError(
+        'ChaosConstruction region size cannot exceed the number of values.');
     }
     this._numRegions = geometry.numGridCells / this._regionSize;
     // Region labels reuse the normal value bitmask representation.
@@ -174,7 +190,7 @@ export class ChaosConstruction extends SudokuConstraintHandler {
     const numGridCells = geometry.numGridCells;
 
     // === Immutable configuration (built once, never mutated) ===
-    this._neighbors = neighborTable(geometry.numRows, geometry.numCols);  // 4-neighbour adjacency
+    this._neighbors = neighborTable(geometry);  // 4-neighbour adjacency
 
     // === Branch state (saved/restored across backtracking by stateAllocator) ===
     // NOTE: the two allocate() calls must keep this relative order — offsets are
@@ -186,11 +202,10 @@ export class ChaosConstruction extends SudokuConstraintHandler {
     // Union-find over cells known to share a region (the shard forest), seeded
     // from the explicit region-link clues.
     const regionShardRoots = Uint16Array.from({ length: numGridCells }, (_, cell) => cell);
-    this._regionShardOffset = 0;
     for (const link of this._regionLinks) {
       const root = link[0];
       for (let i = 1; i < link.length; i++) {
-        unionShardRoots(regionShardRoots, this._regionShardOffset, root, link[i]);
+        unionShardRoots(regionShardRoots, 0, root, link[i]);
       }
     }
     this._regionShardOffset = stateAllocator.allocate(regionShardRoots);
@@ -490,6 +505,9 @@ export class ChaosConstruction extends SudokuConstraintHandler {
     let componentRootCount = 0;
     let reachedFixedSize = shardSizes[startRoot];
     const maxExtraSize = this._regionSize - fixedSize;
+    // Shards fixed earlier in the pass can push the core past the region size.
+    this._scratchGridCells0Size = 0;
+    if (maxExtraSize < 0) return 0;
     rootCountsByDistance.fill(0, 0, maxExtraSize + 1);
     visitMarks[startRoot] = visitId;
     rootsByDistance[rootCountsByDistance[0]++] = startRoot;
@@ -1131,12 +1149,13 @@ export class ChaosArrow extends SudokuConstraintHandler {
     this._offset += geometry.valueOffset;
     const maxArmCells = this._regionArms.reduce((sum, arm) => sum + arm.length, 0)
       - this._duplicateStartCount;
-    const maxValueCount = Math.min(geometry.numValues, maxArmCells - this._offset);
-    if (maxValueCount < 1) return false;
+    const maxLength = Math.min(geometry.numValues + this._offset, maxArmCells);
+    if (maxLength - this._offset < 1) return false;
 
+    const graph = geometry.cellGraph();
     this._canMergeRegionShards = this._regionRunArms.every(arm => {
       for (let i = 1; i < arm.length; i++) {
-        if (!cellsAreAdjacent(arm[i - 1], arm[i], geometry.numCols)) return false;
+        if (!graph.cellEdges(arm[i - 1]).includes(arm[i])) return false;
       }
       return true;
     });
@@ -1158,7 +1177,7 @@ export class ChaosArrow extends SudokuConstraintHandler {
     // (e.g. arrows in all four directions),
     // the run must extend into that arm, so the run length is >= 2. Unlike a
     // count, a run length has no per-cell growth, so this is purely static.
-    const neighbors = neighborTable(geometry.numRows, geometry.numCols);
+    const neighbors = neighborTable(geometry);
     const armSteps = new Set();
     for (const arm of this._regionRunArms) {
       if (arm.length >= 2) armSteps.add(arm[1]);
@@ -1166,12 +1185,10 @@ export class ChaosArrow extends SudokuConstraintHandler {
     const enclosed = enclosingNeighbors(
       neighbors, this._regionRunArms[0][0], armSteps) !== null;
 
-    // Keep only feasible run lengths [minLength, maxValueCount]
+    // Keep only feasible run lengths [minLength, maxLength].
     const minLength = enclosed ? 2 : 1;
-    const loBit = Math.max(0, minLength - 1 - this._offset);
-    if (loBit >= maxValueCount) return false;
-    const rangeMask = (1 << maxValueCount) - (1 << loBit);
-    return !!(initialGridCells[this._controlCell] &= rangeMask);
+    return restrictControlRange(
+      initialGridCells, this._controlCell, minLength, maxLength, this._offset);
   }
 
   _lengthMaskForRegion(grid, arm, regionBit, maxControlLength, minLength) {
@@ -1349,16 +1366,10 @@ export class ChaosArrow extends SudokuConstraintHandler {
       runSupportMasks.fill(0);
     }
 
-    // Shift control mask so internal arm length = control value + offset.
-    // The combined offset can be negative, so shift either direction.
     const offset = this._offset;
-    const internalControlMask =
-      offset >= 0 ? controlMask << offset : controlMask >>> -offset;
-    this._updateRunSupportMasks(grid, internalControlMask);
+    this._updateRunSupportMasks(grid, toInternalMask(controlMask, offset));
 
-    // Shift supported mask back to external control value space.
-    const supportedControlMask = offset >= 0
-      ? this._supportedControlMask >>> offset : this._supportedControlMask << -offset;
+    const supportedControlMask = toControlMask(this._supportedControlMask, offset);
     if (!(controlMask &= supportedControlMask)) return false;
     if (controlMask !== grid[controlCell]) {
       grid[controlCell] = controlMask;
@@ -1454,13 +1465,14 @@ export class ChaosCount extends SudokuConstraintHandler {
 
   initialize(initialGridCells, cellExclusions, geometry, stateAllocator) {
     this._offset += geometry.valueOffset;
-    const maxCount = Math.min(geometry.numValues, this._regionCells.length - this._offset);
+    const maxCount = Math.min(geometry.numValues + this._offset, this._regionCells.length);
 
     const regionRunCells = this._regionRunCells;
+    const graph = geometry.cellGraph();
     const mergePairs = [];
     for (let i = 1; i < regionRunCells.length; i++) {
       for (let j = 0; j < i; j++) {
-        if (!cellsAreAdjacent(regionRunCells[i], regionRunCells[j], geometry.numCols)) continue;
+        if (!graph.cellEdges(regionRunCells[i]).includes(regionRunCells[j])) continue;
         mergePairs.push(j, i);
       }
     }
@@ -1471,7 +1483,7 @@ export class ChaosCount extends SudokuConstraintHandler {
     // an orthogonal neighbour; if every neighbour is itself a counted cell that
     // neighbour is counted, so the count is >= 2. The neighbours (as region-lane
     // cells) are kept for the stronger per-region check in enforceConsistency.
-    const neighbors = neighborTable(geometry.numRows, geometry.numCols);
+    const neighbors = neighborTable(geometry);
     const counted = new Set(regionRunCells);
     const regionCellOffset = this._regionCells[0] - regionRunCells[0];
     const enclosingCells = enclosingNeighbors(neighbors, regionRunCells[0], counted);
@@ -1481,10 +1493,8 @@ export class ChaosCount extends SudokuConstraintHandler {
     const minCount = this._firstCellEnclosed ? 2 : 1;
 
     // Keep only the feasible counts [minCount, maxCount].
-    const loBit = Math.max(0, minCount - 1 - this._offset);
-    if (loBit >= maxCount) return false;
-    const rangeMask = (1 << maxCount) - (1 << loBit);
-    return !!(initialGridCells[this._controlCell] &= rangeMask);
+    return restrictControlRange(
+      initialGridCells, this._controlCell, minCount, maxCount, this._offset);
   }
 
   enforceConsistency(grid, pQueue) {
@@ -1499,11 +1509,8 @@ export class ChaosCount extends SudokuConstraintHandler {
     supportedRegionCellMasks.fill(0);
     let regionValues = firstRegionMask;
     const numRegionCells = regionCells.length;
-    // Shift control mask so internal count = control value + offset.
-    // The combined offset can be negative, so shift either direction.
     const offset = this._offset;
-    const internalControlMask =
-      offset >= 0 ? controlMask << offset : controlMask >>> -offset;
+    const internalControlMask = toInternalMask(controlMask, offset);
     // Union of the regions a neighbour is already fixed to (singleton masks), so
     // the per-region connectivity check below is a single bit test.
     let fixedNeighborMask = regionValues;
@@ -1537,7 +1544,7 @@ export class ChaosCount extends SudokuConstraintHandler {
       }
 
       if (!countMask) continue;
-      supportedControlMask |= offset <= 0 ? countMask << -offset : countMask >>> offset;
+      supportedControlMask |= toControlMask(countMask, offset);
       supportedFirstRegionMask |= regionBit;
       // Drop the lowest supported count (== minCount) to learn if an optional
       // cell may match, and the highest (== maxCount) to learn if one may not.
@@ -1603,7 +1610,12 @@ export class ChaosFixedValueRegionExclusion extends SudokuConstraintHandler {
     this._sourceIndex = sourceIndex;
     this._numGridCells = numGridCells;
     this._regionCellOffset = regionCellOffset;
-    this.idStr = [this.constructor.name, sourceIndex, triggerCell].join('|');
+  }
+
+  static DEDUPES = true;
+
+  dedupId() {
+    return [this.constructor.name, this._sourceIndex, this.cells[0]].join('|');
   }
 
   enforceConsistency(grid, pQueue) {

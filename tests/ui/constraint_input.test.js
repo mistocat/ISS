@@ -682,7 +682,7 @@ await runTest('the grid type select follows the geometry', () => {
   const { shape, gridTypeSelect } = createShapeInput();
 
   assert.deepEqual(
-    gridTypeSelect.children.map(o => o.value), ['Sudoku', 'Raw']);
+    gridTypeSelect.children.map(o => o.value), ['Sudoku', 'Raw', 'YinYang']);
 
   shape.reshape(CellGeometry.fromGridSize(9));
   assert.equal(gridTypeSelect.value, 'Sudoku');
@@ -706,9 +706,14 @@ await runTest('_applyGridType reverts when the value range is invalid', () => {
   shape.reshape(CellGeometry.fromShapeSpec('9x9~1-2~Raw'));
   gridTypeSelect.value = 'Sudoku';
   shape._applyGridType('Sudoku');
-
   assert.equal(collection.shaped, null);
   assert.equal(gridTypeSelect.value, 'Raw');
+
+  // A valid range is kept: a 9-value Sudoku grid keeps its 9 values (the
+  // extras are for var cells).
+  shape.reshape(CellGeometry.fromGridSize(9));
+  shape._applyGridType('YinYang');
+  assert.equal(collection.shaped.name, '9x9~~YinYang');
 });
 
 await runTest('_applyShape keeps the grid type when typing dims', () => {
@@ -735,9 +740,132 @@ await runTest('checkbox categories disable for a Raw grid', () => {
   assert.ok([...layout._checkboxes.values()].some(
     item => !item.element.disabled));
 
+  // On a Raw grid only the checkboxes that don't need Sudoku rules (i.e.
+  // Yin-Yang) stay enabled.
   layout.reshape(raw);
-  assert.ok([...layout._checkboxes.values()].every(
-    item => item.element.disabled));
+  for (const item of layout._checkboxes.values()) {
+    assert.equal(
+      item.element.disabled,
+      item.constraint.type !== 'YinYang',
+      `${item.constraint.type} disabled state`);
+  }
 });
 
 logSuiteComplete('ConstraintCategoryInput.GivenCandidates');
+
+// ============================================================================
+// ConstraintCategoryInput.CellGroup
+// ============================================================================
+
+const createCellGroupInput = () => {
+  const panel = createMockElement(
+    'div', { id: 'cell-group-constraint-container' });
+  elementsById['cell-group-constraint-container'] = panel;
+
+  const form = createMockElement('form', { id: 'connected-values-input' });
+  for (const field of ['cell-group', 'values', 'size']) {
+    form[field] = createMockElement('input');
+  }
+  globalThis.document.forms = {
+    ...globalThis.document.forms,
+    'connected-values-input': form,
+  };
+
+  const collection = createMockCollection();
+  const input = new ConstraintCategoryInput.CellGroup(collection);
+  input.setUpdateCallback();
+  return { input, collection, panel, form };
+};
+
+const geometryWithGroups = (prefixes) => {
+  const geometry = CellGeometry.fromGridSize(9);
+  geometry.addVarCellsForConstraints(
+    prefixes.map(prefix => new SudokuConstraint.Var(prefix, '', 9)));
+  return geometry;
+};
+
+await runTest('CellGroup: a Sudoku grid shows the panel only for var cells', () => {
+  const { input, panel } = createCellGroupInput();
+
+  input.reshape(CellGeometry.fromGridSize(9));
+  assert.equal(panel.style.display, 'none');
+
+  input.reshape(geometryWithGroups(['A']));
+  assert.equal(panel.style.display, '');
+});
+
+await runTest('CellGroup: the grid alone only shows for a non-Sudoku grid', () => {
+  const { input, collection, panel, form } = createCellGroupInput();
+
+  input.reshape(CellGeometry.fromShapeSpec('9x9~~Raw'));
+  assert.equal(panel.style.display, '');
+  assert.deepEqual(
+    form['cell-group'].children.map(o => o.textContent), ['Grid']);
+
+  form['cell-group'].value = '';
+  form['values'].value = '1';
+  form['size'].value = '';
+  input._addConnectedValues();
+  assert.equal(collection.constraints[0].toString(), '.ConnectedValues~~1');
+});
+
+await runTest('CellGroup: the group select follows var cell changes', () => {
+  const { input, form } = createCellGroupInput();
+  const geometry = CellGeometry.fromGridSize(9);
+  input.reshape(geometry);
+  assert.deepEqual(
+    form['cell-group'].children.map(o => o.value), ['']);
+
+  geometry.addVarCellsForConstraints(
+    [new SudokuConstraint.Var('A', 'lights', 9),
+    new SudokuConstraint.Var('B', '', 4)]);
+
+  // The grid remains a valid target alongside the groups.
+  const options = form['cell-group'].children;
+  assert.deepEqual(
+    options.map(o => o.value), ['', 'VA', 'VB']);
+  assert.deepEqual(
+    options.map(o => o.textContent), ['Grid', '$A: lights', '$B']);
+});
+
+await runTest('CellGroup: adds a ConnectedValues for the selected group', () => {
+  const { input, collection, form } = createCellGroupInput();
+  input.reshape(geometryWithGroups(['A', 'B']));
+
+  form['cell-group'].value = 'VB';
+  form['values'].value = '1, 2 3';
+  form['size'].value = '4';
+  input._addConnectedValues();
+
+  assert.equal(collection.constraints.length, 1);
+  assert.equal(
+    collection.constraints[0].toString(), '.ConnectedValues~VB~1_2_3~4');
+});
+
+await runTest('CellGroup: an empty size leaves the region unconstrained', () => {
+  const { input, collection, form } = createCellGroupInput();
+  input.reshape(geometryWithGroups(['A']));
+
+  form['cell-group'].value = 'VA';
+  form['values'].value = '5';
+  form['size'].value = '';
+  input._addConnectedValues();
+
+  assert.equal(
+    collection.constraints[0].toString(), '.ConnectedValues~VA~5');
+});
+
+await runTest('CellGroup: rejects values outside the grid range', () => {
+  const { input, collection, form } = createCellGroupInput();
+  input.reshape(geometryWithGroups(['A']));
+  form['cell-group'].value = 'VA';
+  form['size'].value = '';
+
+  for (const values of ['', '10', '1,x', '0']) {
+    form['values'].value = values;
+    assert.throws(() => input._addConnectedValues());
+  }
+  assert.equal(collection.constraints.length, 0);
+});
+
+logSuiteComplete('ConstraintCategoryInput.CellGroup');

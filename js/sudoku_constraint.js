@@ -181,13 +181,17 @@ export class SudokuConstraintBase {
   }
 
   // Whether this constraint can exist on the geometry: its type is valid for
-  // the shape, and all its cells exist.
+  // the shape, the groups it requires exist, and all its cells exist.
   isDefinedFor(geometry) {
     if (!this.constructor.isValidForShape(geometry)) {
       return false;
     }
     if (this.constructor.IS_COMPOSITE) {
       return this.constraints.every(c => c.isDefinedFor(geometry));
+    }
+    if (this.requiredVarCellPrefixes().some(
+      prefix => !geometry.varCellsForGroup(prefix))) {
+      return false;
     }
     try {
       for (const cellId of this.getCells(geometry)) {
@@ -200,6 +204,12 @@ export class SudokuConstraintBase {
   }
 
   getVarCellGroups(geometry) {
+    return [];
+  }
+
+  // Prefixes of the var cell groups which this constraint requires, but does
+  // not define itself.
+  requiredVarCellPrefixes() {
     return [];
   }
 
@@ -682,9 +692,14 @@ class ChaosConstraintBase extends SudokuConstraintBase {
     return new this.constructor(shiftFn(gridCell));
   }
 
+  requiredVarCellPrefixes() {
+    return ['CC'];
+  }
+
   getCells(geometry) {
     const regionCells = geometry.varCellsForGroup('CC');
-    if (!regionCells) return [this.cells[0], 'CC1'];
+    // Without the region cells, only the control cell can be resolved.
+    if (!regionCells) return [this.cells[0]];
 
     const regionCellOffset = regionCells[0];
     const ccCells = this.expandedRegionCells(geometry);
@@ -885,6 +900,8 @@ export class SudokuConstraint {
     static REQUIRES_SUDOKU_GRID = true;
     static DISPLAY_CONFIG = { displayClass: 'Jigsaw' };
     static UNIQUENESS_KEY_FIELD = 'cells';
+    // Layout symbol for a cell in no region; never a valid region index.
+    static UNCLAIMED_CELL = '_';
 
     constructor(shapeSpec, ...cells) {
       super(shapeSpec, ...cells);
@@ -897,6 +914,8 @@ export class SudokuConstraint {
     static *makeFromArgs(args, geometry) {
       // Legacy format: .Jigsaw~<shapeSpec>~<layout>
       // New format:    .Jigsaw~<layout>
+      // The layout has one character per cell: a region index digit, or
+      // UNCLAIMED_CELL for a cell in no region.
       // Ignore any legacy leading argument(s) and take the layout as the last
       // argument.
       if (args.length < 1 || args.length > 2) {
@@ -910,29 +929,33 @@ export class SudokuConstraint {
           `but layout has ${layoutStr.length}`);
       }
 
+      const hasUnclaimedCells = layoutStr.includes(this.UNCLAIMED_CELL);
+
       const map = new MultiMap();
       for (let i = 0; i < layoutStr.length; i++) {
+        if (layoutStr[i] === this.UNCLAIMED_CELL) continue;
         map.add(layoutStr[i], i);
       }
 
       // If all the cells in the grid are in one region, then no constraint
       // is needed.
-      if (map.size === 1) return;
+      if (map.size === 1 && !hasUnclaimedCells) return;
 
       const maxRegionSize = geometry.numValues;
       const minRegionSize = CellGeometry.defaultNumValues(
         geometry.numRows, geometry.numCols);
 
-      let sawOtherRegionSize = false;
+      // Legacy strings mark unclaimed cells like an ordinary region, so
+      // tolerate one odd-sized region unless UNCLAIMED_CELL is in use.
+      let allowOtherRegionSize = !hasUnclaimedCells;
       for (const [, region] of map) {
         const len = region.length;
         if (len >= minRegionSize && len <= maxRegionSize) {
           yield new this(
             geometry.name,
             ...region.map(c => geometry.makeCellIdFromIndex(c)));
-        } else if (!sawOtherRegionSize) {
-          // Allow one region to have a different size for partially filled grids.
-          sawOtherRegionSize = true;
+        } else if (allowOtherRegionSize) {
+          allowOtherRegionSize = false;
         } else {
           throw Error('Inconsistent region sizes in jigsaw layout');
         }
@@ -961,13 +984,14 @@ export class SudokuConstraint {
       const indexMap = new Map();
       partsGrid.forEach((part) => {
         // Create a new index when we first encounter a part.
-        if (!indexMap.has(part)) {
+        if (part !== null && !indexMap.has(part)) {
           const index = indexMap.size;
           indexMap.set(part, index.toString(geometry.numValues + 1));
         }
       });
 
-      const layoutStr = partsGrid.map(part => indexMap.get(part)).join('');
+      const layoutStr = partsGrid.map(
+        part => part === null ? this.UNCLAIMED_CELL : indexMap.get(part)).join('');
       return this._argsToString(layoutStr);
     }
   }
@@ -987,10 +1011,6 @@ export class SudokuConstraint {
       super(...cells);
       this.cells = cells;
     }
-
-    static fnKey = memoize((numValues, valueOffset = 0) =>
-      fnToBinaryKey((a, b) => a < b, numValues, valueOffset)
-    );
 
     static displayName() {
       return 'Thermometer';
@@ -1768,6 +1788,33 @@ export class SudokuConstraint {
     }
   }
 
+  static YinYang = class YinYang extends SudokuConstraintBase {
+    static DESCRIPTION = (`
+      Adds a yin-yang shading layer over the grid: every cell is either
+      shaded or unshaded, each shade forms a single orthogonally-connected
+      region, and no 2x2 box is entirely one shade.
+      The shading is the YY cell group, where the grid's two lowest values
+      mean shaded and unshaded respectively.`);
+    static CATEGORY = 'LayoutCheckbox';
+    static UNIQUENESS_KEY_FIELD = 'type';
+    static VALIDATE_SHAPE_FN = (geometry) =>
+      geometry.gridType !== CellGeometry.YIN_YANG_GRID_TYPE
+      && geometry.numValues >= 2;
+
+    static displayName() {
+      return 'Yin-Yang';
+    }
+
+    getVarCellGroups(geometry) {
+      return [{
+        prefix: 'YY',
+        label: 'Yin-Yang',
+        count: geometry.numGridCells,
+        columns: geometry.numCols,
+      }];
+    }
+  }
+
   static AntiKing = class AntiKing extends SudokuConstraintBase {
     static DESCRIPTION = (`
       Cells which are a king's move away cannot have the same value.`);
@@ -2531,8 +2578,17 @@ export class SudokuConstraint {
       this.valueStr = values.replace(/_/g, ',');
     }
 
+    _compactValueStr() {
+      const counts = new Map();
+      for (const v of this.values.split('_')) {
+        counts.set(v, (counts.get(v) || 0) + 1);
+      }
+      return [...counts].map(
+        ([v, count]) => count > 1 ? `${count}×${v}` : v).join(' ');
+    }
+
     chipLabel() {
-      return `ContainAtLeast (${this.valueStr})`;
+      return `ContainAtLeast (${this._compactValueStr()})`;
     }
   }
 
@@ -2543,7 +2599,7 @@ export class SudokuConstraint {
       repeated in the list.`);
 
     chipLabel() {
-      return `ContainExact (${this.valueStr})`;
+      return `ContainExact (${this._compactValueStr()})`;
     }
   };
 
@@ -2584,7 +2640,7 @@ export class SudokuConstraint {
       values must form a single orthogonally-connected region.
       An optional size requires the region to contain exactly that
       many cells.`);
-    static CATEGORY = 'Experimental';
+    static CATEGORY = 'CellGroup';
 
     // Values may be a number, a flat array, or the serialized '1_2' string.
     constructor(groupPrefix, values, size) {
@@ -2609,15 +2665,22 @@ export class SudokuConstraint {
     }
 
     getCells(geometry) {
-      if (!this.groupPrefix) return [];
-      return (geometry.varCellsForGroup(this.groupPrefix) || []).map(
-        c => geometry.makeCellIdFromIndex(c));
+      const cells = this.groupPrefix
+        ? geometry.varCellsForGroup(this.groupPrefix) || []
+        : Array.from({ length: geometry.numGridCells }, (_, i) => i);
+      return cells.map(c => geometry.makeCellIdFromIndex(c));
+    }
+
+    requiredVarCellPrefixes() {
+      return this.groupPrefix ? [this.groupPrefix] : [];
     }
 
     chipLabel() {
-      const group = this.groupPrefix || 'grid';
+      const group = this.groupPrefix ?
+        CellGeometry.displayCellId(this.groupPrefix) : 'grid';
       const size = this.size === null ? '' : `, size ${this.size}`;
-      return `ConnectedValues (${group}: ${this.values.replace(/_/g, ',')}${size})`;
+      const values = this.values.replace(/_/g, ',');
+      return `${this.constructor.displayName()} (${group}: ${values}${size})`;
     }
   };
 

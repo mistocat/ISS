@@ -9,6 +9,7 @@ const { SudokuBuilder } = await import('../../js/solver/sudoku_builder.js');
 const { SudokuConstraint } = await import('../../js/sudoku_constraint.js');
 const { CellGeometry } = await import('../../js/cell_geometry.js');
 const { SudokuSolver, HandlerSet } = await import('../../js/solver/engine.js');
+const { BitSet } = await import('../../js/util.js');
 const {
   SudokuConstraintHandler,
   AllDifferent,
@@ -430,17 +431,90 @@ await runTest('HandlerSet.addSingletonHandlers adds to singleton map', () => {
   assert.equal(all.length, 1);
 });
 
+// Only handlers that opt in take part in dedup, so tests need a class that does.
+class DedupingHandler extends SudokuConstraintHandler {
+  static DEDUPES = true;
+  constructor(cells, id) {
+    super(cells);
+    this._id = id;
+  }
+  // dedupId must distinguish classes too, hence the class name.
+  dedupId() { return `${this.constructor.name}:${this._id}`; }
+}
+
+class DedupingSingleton extends DedupingHandler {
+  static SINGLETON_HANDLER = true;
+}
+
 await runTest('HandlerSet.addSingletonHandlers throws on duplicate', () => {
   const hs = new HandlerSet([], NUM_SEARCH_CELLS);
-  const h1 = new UniqueValueExclusion(0);
-  // Force same idStr to create a duplicate.
-  const h2 = new UniqueValueExclusion(0);
-  h2.idStr = h1.idStr;
+  const h1 = new DedupingSingleton([0], 'duplicate-singleton');
+  const h2 = new DedupingSingleton([0], 'duplicate-singleton');
 
   hs.addSingletonHandlers(h1);
   assert.throws(
     () => hs.addSingletonHandlers(h2),
     /Singleton handlers must be unique/);
+});
+
+await runTest('HandlerSet should not dedupe handlers which do not opt in', () => {
+  const hs = new HandlerSet([], NUM_SEARCH_CELLS);
+  // Two identical-looking handlers both survive.
+  const h1 = new SudokuConstraintHandler([0, 1, 2]);
+  const h2 = new SudokuConstraintHandler([0, 1, 2]);
+  assert.equal(SudokuConstraintHandler.DEDUPES, false);
+
+  hs.add(h1, h2);
+  assert.equal(hs.numHandlers(), 2);
+});
+
+await runTest('HandlerSet should dedupe handlers sharing a dedupId', () => {
+  const hs = new HandlerSet([], NUM_SEARCH_CELLS);
+  const h1 = new DedupingHandler([0, 1, 2], 'same-content');
+  const h2 = new DedupingHandler([0, 1, 2], 'same-content');
+
+  hs.add(h1, h2);
+  assert.equal(hs.numHandlers(), 1);
+  assert.equal(hs.getAll()[0], h1);
+});
+
+await runTest('HandlerSet dedup should keep the handler essential if either is', () => {
+  const hs = new HandlerSet([], NUM_SEARCH_CELLS);
+  const h1 = new DedupingHandler([0, 1, 2], 'same-content');
+  const h2 = new DedupingHandler([0, 1, 2], 'same-content');
+
+  // The kept handler is the non-essential one, so the merge has to upgrade it.
+  hs.addNonEssential(h1);
+  assert.equal(h1.essential, false);
+  hs.add(h2);
+
+  assert.equal(hs.numHandlers(), 1);
+  assert.equal(hs.getAll()[0].essential, true);
+});
+
+await runTest('HandlerSet should keep same-cell handlers with different ids', () => {
+  const hs = new HandlerSet([], NUM_SEARCH_CELLS);
+  // Identical class and cells, so these share a hash bucket: only the exact
+  // dedupId separates them.
+  const h1 = new DedupingHandler([0, 1, 2], 'first');
+  const h2 = new DedupingHandler([0, 1, 2], 'second');
+  const h3 = new DedupingHandler([0, 1, 2], 'first');
+
+  hs.add(h1, h2, h3);
+  assert.equal(hs.numHandlers(), 2);
+  assert.deepEqual(hs.getAll().map(h => h._id), ['first', 'second']);
+});
+
+await runTest('HandlerSet should not confuse a subclass with its parent', () => {
+  const hs = new HandlerSet([], NUM_SEARCH_CELLS);
+  // Same cells and same content, so these collide and are separated only by
+  // dedupId including the class name.
+  class Subclass extends DedupingHandler { }
+  const parent = new DedupingHandler([0, 1, 2], 'shared-id');
+  const child = new Subclass([0, 1, 2], 'shared-id');
+
+  hs.add(parent, child);
+  assert.equal(hs.numHandlers(), 2);
 });
 
 logSuiteComplete('HandlerSet');

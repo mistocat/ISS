@@ -115,6 +115,95 @@ await runTest('lint_sandbox_script flags numValues/Shape mismatch and id templat
   assert.match(report(items), /manual-cell-id-template/);
 });
 
+await runTest('num-values-mismatch resolves a const alias of the count', () => {
+  // Renaming the literal must not silence the decided branch: rFEBuV4ssgY
+  // aliased its flagged 2 to SHADE_VALUES and shipped the bug (#1762).
+  const items = lintSource(SCRIPT_HEADER
+    + 'const SHADE_VALUES = 2;\n'
+    + 'const key = Pair.fnToKey((a, b) => a === b, SHADE_VALUES);\n'
+    + "return [new Shape('9x9'), new Pair(key, 'x', 'R1C1', 'R1C2')];\n");
+  assert.match(report(items), /num-values-mismatch/);
+  assert.match(report(items), /via `SHADE_VALUES`/);
+  assert.match(report(items), /cannot be suppressed/);
+});
+
+await runTest('num-values-mismatch leaves a matching const alias alone', () => {
+  const items = lintSource(SCRIPT_HEADER
+    + 'const NV = 9;\n'
+    + 'const key = Pair.fnToKey((a, b) => a === b, NV);\n'
+    + "return [new Shape('9x9'), new Pair(key, 'x', 'R1C1', 'R1C2')];\n");
+  assert.doesNotMatch(report(items), /num-values-mismatch/);
+});
+
+await runTest('num-values-mismatch on a decided encodeSpec alias cannot be excused', () => {
+  // Even a deliberate sentinel cap belongs in the domain or the spec, not the
+  // table size (8L4ffie834I: widening to the geometry left its search
+  // bit-for-bit identical), so lint-ok does not silence the decided branch.
+  const items = lintSource(SCRIPT_HEADER
+    + 'const SENTINEL = 8;\n'
+    + '// lint-ok: num-values-mismatch\n'
+    + 'const enc = NFA.encodeSpec(spec, SENTINEL);\n'
+    + "return [new Shape('6x6', 13), new NFA(enc, 'x', 'R1C1')];\n");
+  assert.match(report(items), /num-values-mismatch/);
+  assert.match(report(items), /via `SENTINEL`/);
+  assert.match(report(items), /cannot be suppressed/);
+});
+
+await runTest('num-values-mismatch skips a count the Shape alphabet is built from', () => {
+  // `0-${N - 1}` against fnToKey(fn, N, -1) co-varies by construction: the
+  // alphabet cannot drift from the count, so the unverifiable branch is quiet
+  // (ApkQ64eyV5c). A count under a DIFFERENT symbol still reports.
+  const script = (countName) => SCRIPT_HEADER
+    + 'const N = 15;\n'
+    + `const ${countName === 'N' ? 'unused' : countName} = 15;\n`
+    + `const key = Pair.fnToKey((a, b) => a < b, ${countName}, -1);\n`
+    + 'return [new Shape(\'9x9\', `0-${N - 1}`), '
+    + "new Pair(key, 'x', 'R1C1', 'R1C2')];\n";
+  assert.doesNotMatch(report(lintSource(script('N'))), /num-values-mismatch/);
+  assert.match(report(lintSource(script('M'))), /num-values-mismatch/);
+});
+
+await runTest('stale-num-values flags a grid-geometry count on a widened Shape', () => {
+  // graph.gridGeometry() is a snapshot taken before the returned Shape is applied,
+  // so its numValues is the old, narrower count.
+  const items = lintSource(SCRIPT_HEADER
+    + "const graph = cellGraph('9x9');\n"
+    + 'const geometry = graph.gridGeometry();\n'
+    + 'const enc = NFA.encodeSpec(spec, geometry.numValues);\n'
+    + "return [new Shape('9x9', 12), new NFA(enc)];\n");
+  assert.match(report(items), /stale-num-values/);
+});
+
+await runTest('stale-num-values follows Shape derivation transitively', () => {
+  // cellGraph(shape).gridGeometry() already carries the widened count, so the
+  // chain has to be followed rather than only the first hop.
+  const items = lintSource(SCRIPT_HEADER
+    + "const shape = new Shape('9x9', 10);\n"
+    + 'const graph = cellGraph(shape);\n'
+    + 'const geometry = graph.gridGeometry();\n'
+    + 'const enc = NFA.encodeSpec(spec, geometry.numValues);\n'
+    + 'return [shape, new NFA(enc)];\n');
+  assert.doesNotMatch(report(items), /stale-num-values/);
+});
+
+await runTest('stale-num-values accepts a count read off the Shape itself', () => {
+  const items = lintSource(SCRIPT_HEADER
+    + "const shape = new Shape('9x9', 12);\n"
+    + 'const enc = NFA.encodeSpec(spec, shape.numValues);\n'
+    + 'return [shape, new NFA(enc)];\n');
+  assert.doesNotMatch(report(items), /stale-num-values/);
+});
+
+await runTest('stale-num-values ignores an unwidened board', () => {
+  // Without widening the grid spec's count IS the final count, so there is
+  // nothing for the read to be stale against.
+  const items = lintSource(SCRIPT_HEADER
+    + "const graph = cellGraph('9x9');\n"
+    + 'const enc = NFA.encodeSpec(spec, graph.gridGeometry().numValues);\n'
+    + "return [new Shape('9x9'), new NFA(enc)];\n");
+  assert.doesNotMatch(report(items), /stale-num-values/);
+});
+
 await runTest('value-range lint uses the returned host Shape, not an earlier local Shape', () => {
   const items = lintSource(SCRIPT_HEADER
     + "const binaryShape = new Shape('1x1', 2);\n"
@@ -352,6 +441,11 @@ await runTest('lint_sandbox_script flags row-major arithmetic into Var cell()', 
     + 'const first = GRID.cell(1);\n'
     + 'const next = i => GRID.cell(i + 1);\n'
     + 'const unrelated = table.cell(r * 9 + c);\n'
+    // cell(row, col) folds against the declared columns itself, so arithmetic in
+    // its ROW argument addresses the group rather than folding it. A layer whose
+    // rows are not 1:1 with grid rows (19 rows over a 10x10 board) has no
+    // makeOverlay()/at() reading at all, so flagging it left no way to write it.
+    + 'const layer = GRID.cell((r - 1) * 2 + 1, c);\n'
     + "return [new Shape('1x1'), GRID];\n");
   assert.doesNotMatch(report(clean), /manual-var-cell-arithmetic/);
 });
@@ -452,6 +546,34 @@ await runTest('lint_constraints flags adjacency-paired clues that drop cells', (
   // diagonal Whisper is perfectly valid and must not be swept up.
   const diagonalWhisper = lintConstraintText('.Shape~4x4\n.Whisper~2~R1C1~R2C2~R3C3\n');
   assert.doesNotMatch(report(diagonalWhisper), /adjacency-clue-drops-cells/);
+});
+
+await runTest('lint_constraints flags two clues collapsing onto one anchor', () => {
+  // eIYhjdAXqZw drew two digit circles at each corner, nudged apart only for
+  // rendering. Emitted as two Quads they key on the same topLeftCell and the
+  // later replaces the earlier -- four clues gone with no error. Clue coverage
+  // cannot see it either: both name the same four cells.
+  const collapsed = lintConstraintText(
+    '.Shape~9x9\n.Quad~R1C1~1~2\n.Quad~R1C1~3~4\n');
+  assert.match(report(collapsed),
+    /co-anchored-constraint-dropped.*Quad shares uniqueness key "R1C1".*line 2/);
+
+  // The merge the rule asks for.
+  assert.doesNotMatch(
+    report(lintConstraintText('.Shape~9x9\n.Quad~R1C1~1~2~3~4\n')),
+    /co-anchored-constraint-dropped/);
+
+  // Two branches of an Or are one hypothesis each, not two clues on one anchor.
+  assert.doesNotMatch(
+    report(lintConstraintText(
+      '.Shape~9x9\n.Or\n.Quad~R1C1~1~2\n.Quad~R1C1~3~4\n.End\n')),
+    /co-anchored-constraint-dropped/);
+
+  // Given merges by intersection, so two on one cell narrow it rather than
+  // losing one. Only the default last-one-wins merge drops a clue.
+  assert.doesNotMatch(
+    report(lintConstraintText('.Shape~9x9\n.~R1C1_1_2\n.~R1C1_2_3\n')),
+    /co-anchored-constraint-dropped/);
 });
 
 await runTest('lint_constraints --script runs inputs through the sandbox', async () => {
@@ -648,6 +770,17 @@ await runTest('lint_constraints suggests Quad for a 2x2 ContainAtLeast', async (
     + "  new ContainAtLeast('4', 'R1C1', 'R1C2', 'R2C1', 'R2C2'),\n"
     + "  new ContainAtLeast('3', 'R3C1', 'R3C2', 'R3C3')];\n");
   assert.doesNotMatch(report(thermoFamily), /contain-at-least-use-quad/);
+
+  // Quad is a drawn grid clue. Four cells of a Var overlay can form a 2x2 in
+  // that layer's own geometry -- a shading layer's no-monochrome-2x2 rule is
+  // exactly this shape -- but no quad is drawn there, so ContainAtLeast stands.
+  const overlay = await lintScript(
+    "const graph = cellGraph('9x9');\n"
+    + "const shade = graph.makeOverlay('VS');\n"
+    + "return [new Shape('9x9'), shade.toVar('shade'),\n"
+    + "  shade.makeReplicate(new Given(shade.cells()[0], 1, 2)),\n"
+    + "  new ContainAtLeast('1_2', ...shade.at(graph.block('R1C1', 2, 2)))];\n");
+  assert.doesNotMatch(report(overlay), /contain-at-least-use-quad/);
 });
 
 // The cases above test the pure lint logic directly. This one exercises the CLI
@@ -892,12 +1025,47 @@ await runTest('source rules see code, not comments', () => {
   assert.match(report(code), /sum-wire-format/);
 });
 
+// Blocker #1191: three of MAL2QLszGjE's clue rows list the candidate digits
+// 1, 4, 7, and the worker had to suppress the linter on each of them.
+await runTest('a stored triple is clue data, not box construction', () => {
+  const table = lintSource(SCRIPT_HEADER
+    + 'const circles = [\n'
+    + "  { cells: ['R1C8', 'R1C9'], values: [1, 4, 7] },\n"
+    + "  { cells: ['R5C4', 'R5C5'], values: [1, 4, 7] },\n"
+    + '];\n'
+    + "return [new Shape('9x9'), ...circles.map(c => new ContainExact(c.values.join('_'), ...c.cells))];\n");
+  assert.equal(table.length, 0, report(table));
+
+  // Taking the elements out is the pattern, however the triple is reached.
+  const iterated = lintSource(SCRIPT_HEADER
+    + 'const cells = [];\n'
+    + 'for (const r of [1, 4, 7]) for (const c of [1, 4, 7]) cells.push(makeCellId(r, c));\n'
+    + "return [new Shape('9x9')];\n");
+  assert.match(report(iterated), /manual-box-arithmetic/);
+});
+
+// Blocker #1278: boxRegions returns [] unless the grid type is Sudoku
+// (js/sudoku_constraint.js:269), so graph.boxes() cannot be preferred here.
+await runTest('a Raw grid has no boxes to prefer, so nothing is flagged', () => {
+  const build = 'const boxes = [1, 4, 7].flatMap(r => [1, 4, 7].map(\n'
+    + '  c => graph.block(makeCellId(r, c), 3, 3)));\n';
+  const raw = lintSource(SCRIPT_HEADER + build
+    + "return [new Shape('9x9', '0-5', 'Raw')];\n");
+  assert.equal(raw.length, 0, report(raw));
+
+  // The same construction on a Sudoku grid still has graph.boxes() to prefer.
+  const sudoku = lintSource(SCRIPT_HEADER + build
+    + "return [new Shape('9x9')];\n");
+  assert.match(report(sudoku), /manual-box-arithmetic/);
+});
+
 // An intentional local implementation is documented in the file itself, rather
 // than being re-litigated on every run.
 await runTest('// lint-ok silences one code on one line', () => {
   const trailing = lintSource(SCRIPT_HEADER
     + 'const origins = [1, 4, 7]; // lint-ok: manual-box-arithmetic\n'
     + 'const others = [1, 4, 7];\n'
+    + 'const boxes = origins.flatMap(r => others.map(c => makeCellId(r, c)));\n'
     + "return [new Shape('9x9')];\n");
   // The trailing comment excuses its own line, and only its own line.
   assert.deepEqual(trailing.map(i => i.line), [7], report(trailing));
@@ -905,6 +1073,7 @@ await runTest('// lint-ok silences one code on one line', () => {
   const standalone = lintSource(SCRIPT_HEADER
     + '// lint-ok: manual-box-arithmetic\n'
     + 'const origins = [1, 4, 7];\n'
+    + 'const boxes = origins.flatMap(r => origins.map(c => makeCellId(r, c)));\n'
     + "return [new Shape('9x9')];\n");
   assert.equal(standalone.length, 0, report(standalone));
 

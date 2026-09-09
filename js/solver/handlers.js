@@ -4,10 +4,10 @@ const {
   memoize,
   countOnes16bit,
   isIterable,
-  arrayIntersect,
   RandomIntGenerator,
   shuffleArray,
   MultiMap,
+  sortedArrayCopy,
   BitSet
 } = await import('../util.js' + self.VERSION_PARAM);
 const { LookupTables } = await import('./lookup_tables.js' + self.VERSION_PARAM);
@@ -25,7 +25,9 @@ export class InvalidConstraintError extends Error {
 export class SudokuConstraintHandler {
   static SINGLETON_HANDLER = false;
 
-  static _defaultId = 0;
+  // Set by handlers which two separate constructions can produce identically.
+  // Such handlers must implement dedupId(), which HandlerSet dedupes on.
+  static DEDUPES = false;
 
   constructor(cells) {
     // This constraint is enforced whenever these cells are touched.
@@ -35,10 +37,11 @@ export class SudokuConstraintHandler {
     // By default all constraints are essential for correctness.
     // The optimizer may add non-essential constraints to improve performance.
     this.essential = true;
+  }
 
-    const id = this.constructor._defaultId++;
-    // By default every id is unique.
-    this.idStr = this.constructor.name + '-' + id.toString();
+  // A string uniquely describing this handler, for dedup.
+  dedupId() {
+    throw new Error(this.constructor.name + ' must implement dedupId()');
   }
 
   // Enforce the constraint on the grid and return:
@@ -227,9 +230,8 @@ export class AllDifferent extends SudokuConstraintHandler {
 
     this._enforcementType = enforcementType;
 
-    exclusionCells = Array.from(new Set(exclusionCells));
-    exclusionCells.sort((a, b) => a - b);
-    this._exclusionCells = exclusionCells;
+    this._exclusionCells = sortedArrayCopy(
+      exclusionCells, /* removeDuplicates= */ true);
   }
 
   initialize(initialGridCells, cellExclusions, geometry, stateAllocator) {
@@ -318,7 +320,7 @@ export class ValueDependentUniqueValueExclusion extends SudokuConstraintHandler 
 
   initialize(initialGridCells, cellExclusions, geometry, stateAllocator) {
     // Remove cellExclusions, as it would be redundant.
-    const exclusions = new Set(cellExclusions.getArray(this._cell));
+    const exclusions = cellExclusions.getBitSet(this._cell);
     for (let i = 0; i < this._valueToCellMap.length; i++) {
       this._valueToCellMap[i] = new Uint16Array(
         this._valueToCellMap[i].filter(c => !exclusions.has(c)));
@@ -584,6 +586,9 @@ export class HandlerUtil {
       const candidates = unassigned.clone();
       let numCandidates = numUnassigned;
       const group = [];
+      // `candidates` only shrinks while this group grows, so a cell that has
+      // already been passed over can never become available again.
+      let scan = 0;
 
       // Greedily grow the group into a clique
       while (numCandidates > 0) {
@@ -591,9 +596,9 @@ export class HandlerUtil {
         let bestScore = -1;
         if (strategy === this.GREEDY_STRATEGY_FIRST) {
           // Choose the first available cell in the order of `cells`.
-          for (const cell of cells) {
-            if (candidates.has(cell)) {
-              bestCell = cell;
+          for (; scan < cells.length; scan++) {
+            if (candidates.has(cells[scan])) {
+              bestCell = cells[scan];
               break;
             }
           }
@@ -853,9 +858,12 @@ export class BinaryConstraint extends SudokuConstraintHandler {
     super([cell1, cell2]);
     this._key = key;
     this._tables = [];
+  }
 
-    // Ensure we dedupe binary constraints.
-    this.idStr = [this.constructor.name, key, cell1, cell2].join('-');
+  static DEDUPES = true;
+
+  dedupId() {
+    return [this.constructor.name, this._key, ...this.cells].join('-');
   }
 
   key() {
@@ -946,9 +954,12 @@ export class BinaryPairwise extends SudokuConstraintHandler {
     this._enableHiddenSingles = false;
     this._prefixCache = null;
     this._allChanged = new BitSet(cells.length || 1);
+  }
 
-    // Ensure we dedupe binary constraints.
-    this.idStr = [this.constructor.name, key, ...cells].join('-');
+  static DEDUPES = true;
+
+  dedupId() {
+    return [this.constructor.name, this._key, ...this.cells].join('-');
   }
 
   key() {
@@ -1811,8 +1822,13 @@ export class SameValues extends SudokuConstraintHandler {
   constructor(...cellSets) {
     // Sort to canonicalize the order, both within and between sets.
     // NOTE: We must copy before sorting (to avoid messing up order for the caller).
-    cellSets = cellSets.map(s => [...s].sort((a, b) => a - b))
-      .sort((a, b) => a[0] - b[0]);
+    cellSets = cellSets.map(s => sortedArrayCopy(s));
+    if (cellSets.length === 2) {
+      // Micro-opt for the common case (2 sets).
+      if (cellSets[0][0] > cellSets[1][0]) cellSets.reverse();
+    } else {
+      cellSets.sort((a, b) => a[0] - b[0]);
+    }
 
     const setLen = cellSets[0].length;
     if (!cellSets.every(s => s.length === setLen)) {
@@ -1827,8 +1843,14 @@ export class SameValues extends SudokuConstraintHandler {
     this._buffer1 = null;
     this._buffer2 = null;
     this._stateOffset = -1;
+  }
 
-    this.idStr = [this.constructor.name, ...cellSets].join('-');
+  static DEDUPES = true;
+
+  dedupId() {
+    // The sets are canonically ordered and all the same length, so the flat
+    // cells plus that length determine them: chunking recovers the sets.
+    return `${this.constructor.name}-${this._cellSets[0].length}-${this.cells.join(',')}`;
   }
 
   initialize(initialGridCells, cellExclusions, geometry, stateAllocator) {
@@ -2011,6 +2033,51 @@ export class SameValuesIgnoreCount extends SameValues {
   }
 
   _enforceCounts(grid, pQueue, valueIntersection) {
+    return true;
+  }
+}
+
+export class Thermo extends SudokuConstraintHandler {
+  initialize(initialGridCells, cellExclusions, geometry, stateAllocator) {
+    // A repeated cell would have to be less than itself. Rejecting it here lets
+    // enforceConsistency assume the cells are distinct.
+    return new Set(this.cells).size === this.cells.length;
+  }
+
+  enforceConsistency(grid, pQueue) {
+    const cells = this.cells;
+    const numCells = cells.length;
+
+    // Forward pass + backward pass for arc-consistency.
+    // Remove values which are not above the minimum of the previous cell.
+    let vPrev = grid[cells[0]];
+    for (let i = 1; i < numCells; i++) {
+      const cell = cells[i];
+      const v = grid[cell];
+      const vNew = v & (-(vPrev & -vPrev) << 1);
+      if (!vNew) return false;
+      if (v !== vNew) {
+        grid[cell] = vNew;
+        pQueue.addForCell(cell);
+      }
+      vPrev = vNew;
+    }
+
+    // Remove values which are not below the maximum of the next cell.
+    // Since the forward pass leaves the minimums strictly increasing, every=
+    // cell keeps at least its minimum in the backward pass.
+    let vNext = vPrev;
+    for (let i = numCells - 2; i >= 0; i--) {
+      const cell = cells[i];
+      const v = grid[cell];
+      const vNew = v & ((1 << (31 - Math.clz32(vNext))) - 1);
+      if (v !== vNew) {
+        grid[cell] = vNew;
+        pQueue.addForCell(cell);
+      }
+      vNext = vNew;
+    }
+
     return true;
   }
 }
@@ -2378,12 +2445,7 @@ export class RequiredValues extends SudokuConstraintHandler {
 
     // Find any cells which are mutually exclusive with the entire
     // constraint and remove the values from them.
-    let commonExclusions = cellExclusions.getArray(cells[0]);
-    for (let i = 0; i < cells.length; i++) {
-      commonExclusions = arrayIntersect(
-        commonExclusions, cellExclusions.getArray(cells[i]));
-    }
-    for (const cell of commonExclusions) {
+    for (const cell of cellExclusions.getListExclusions(cells)) {
       if (!(initialGridCells[cell] &= ~this._valueMask)) return false;
     }
 
@@ -2760,9 +2822,7 @@ export class CountingCircles extends SudokuConstraintHandler {
     // - Makes sure that the constraint performance is independent of the sort
     //   order of the cells.
     // - Required for exclusion grouping to work optimally.
-    cells = cells.slice();
-    cells.sort((a, b) => a - b);
-    super(cells);
+    super(sortedArrayCopy(cells));
   }
 
   static _sumCombinations = memoize((numValues) => {

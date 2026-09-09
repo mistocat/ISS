@@ -117,6 +117,11 @@ const findingToItem = (rule, finding) => ({
     : finding.node?.loc.start.line ?? finding.line,
   code: rule.code,
   message: finding.message ?? rule.summary,
+  // A finding may opt out of `lint-ok` when no false positive is possible. Carried
+  // per finding, not per rule: a rule can have one decided branch and one that only
+  // reports what it cannot check. Stripped again in lintSource so the item shape a
+  // caller sees does not change.
+  unsuppressible: finding.unsuppressible === true,
 });
 
 // --- Node predicates shared across rules. ---
@@ -205,6 +210,12 @@ const numericConstants = (ctx) => {
 const isShapeCall = (node) => node?.type === 'NewExpression'
   && node.callee.type === 'Identifier' && node.callee.name === 'Shape';
 
+// CellGeometry.RAW_GRID_TYPE. SudokuConstraintBase.boxRegions returns [] unless
+// the grid type is Sudoku (js/sudoku_constraint.js:269), so graph.box(n) and
+// graph.boxes() are empty by design on a Raw grid and hand-built blocks are the
+// only way to get the standard tiling there.
+const RAW_GRID_TYPE = 'Raw';
+
 // Resolve the host Shape from the returned constraint array. Scripts may also
 // construct smaller Shape objects solely as value-range descriptors for an NFA;
 // lexical order cannot distinguish those from the Shape that defines the puzzle.
@@ -234,9 +245,22 @@ const returnedShapeCall = (ctx) => {
 // shares the app's alphabet grammar instead of reimplementing it. `const N =
 // 15` alphabets are resolved, since naming the alphabet is the common way to
 // widen it.
+const shapeCall = (ctx) => returnedShapeCall(ctx)
+  ?? ctx.nodesOfType('NewExpression').find(isShapeCall);
+
+// The value count the grid spec gives on its own, before any widening. The
+// alphabet may be spelled as a second argument or as a `~` suffix, so the base
+// is the spec with the suffix stripped.
+const baseGridValues = (spec) => {
+  try {
+    return CellGeometry.fromShapeSpec(spec.split('~')[0]).numValues;
+  } catch {
+    return null;
+  }
+};
+
 const parseDeclaredShape = (ctx) => {
-  const call = returnedShapeCall(ctx)
-    ?? ctx.nodesOfType('NewExpression').find(isShapeCall);
+  const call = shapeCall(ctx);
   const spec = stringValue(call?.arguments[0]);
   if (spec === null) return null;
 
@@ -264,9 +288,9 @@ const parseDeclaredShape = (ctx) => {
     return null;  // Not a valid Shape declaration; nothing to check against.
   }
   if (alphabet && text === null) {
-    return { numValues: null, valueOffset: null, raw };  // Widened by an unknown amount.
+    return { numValues: null, valueOffset: null, raw, spec };  // Widened by an unknown amount.
   }
-  return { numValues: geometry.numValues, valueOffset: geometry.valueOffset, raw };
+  return { numValues: geometry.numValues, valueOffset: geometry.valueOffset, raw, spec };
 };
 
 // Whether encodeSpec's opts argument passes valueOffset. Anything the walk
@@ -286,29 +310,42 @@ const hasValueOffsetOption = (opts) => {
 // spelled as (a number literal or a `.numValues` read), and whether the call
 // passes an explicit value offset (opts.valueOffset for encodeSpec, the
 // positional third argument for fnToKey).
-const findValueRangeCalls = (ctx) =>
-  ctx.nodesOfType('CallExpression')
+const findValueRangeCalls = (ctx) => {
+  const consts = numericConstants(ctx);
+  return ctx.nodesOfType('CallExpression')
     .filter((n) => ['encodeSpec', 'fnToKey'].includes(calleeName(n)))
     .map((node) => {
       const args = node.arguments;
       const countArg = args[1];
 
-      const literal = numberValue(countArg);
+      let literal = numberValue(countArg);
+      let aliasName = null;
       let bareCountText = literal !== null ? String(literal) : null;
       if (countArg?.type === 'MemberExpression'
         && memberName(countArg) === 'numValues') {
         bareCountText = ctx.text(countArg);
       }
+      // A numeric const alias is the bare count wearing a name; resolve it so
+      // renaming the literal cannot silence the decided branch (rFEBuV4ssgY
+      // aliased its flagged 2 to SHADE_VALUES and shipped the bug; #1762).
+      if (literal === null && countArg?.type === 'Identifier'
+        && consts.has(countArg.name)) {
+        literal = consts.get(countArg.name);
+        aliasName = countArg.name;
+        bareCountText = countArg.name;
+      }
 
       return {
         node,
         literal,
+        aliasName,
         bareCountText,
         hasExplicitOffset: calleeName(node) === 'fnToKey'
           ? args.length >= 3
           : hasValueOffsetOption(args[2]),
       };
     });
+};
 
 // --- custom-neighbour-helper: what a candidate declaration must do. ---
 
@@ -672,9 +709,12 @@ const RULES = [
       + 'exists, so that math is currently the only idiom. One base triple is\n'
       + 'never flagged -- a row whose cells happen to sit at 1, 4, 7 is not box\n'
       + 'construction. Numeric [1, 4, 7] needs two base uses (a row base and a\n'
-      + 'column base); corner strings need consecutive R{r}C1,R{r}C4,R{r}C7\n'
-      + 'runs for two or more base rows r.',
+      + 'column base), each one reached as a sequence rather than merely stored:\n'
+      + 'a clue table listing candidate digits is data, not geometry. Corner\n'
+      + 'strings need consecutive R{r}C1,R{r}C4,R{r}C7 runs for two or more base\n'
+      + 'rows r. A Raw grid is skipped entirely: graph.boxes() is empty there.',
     check(ctx) {
+      if (stringValue(shapeCall(ctx)?.arguments[2]) === RAW_GRID_TYPE) return [];
       const findings = ctx.nodesOfType('BinaryExpression').filter((bin) =>
         bin.operator === '*' && bin.left.type === 'Identifier'
         && /^b[rc]$/.test(bin.left.name) && numberValue(bin.right) !== null);
@@ -698,9 +738,21 @@ const RULES = [
         if (el) findings.push(el);
       }
       // Box cells need a row base AND a column base, so a numeric [1, 4, 7]
-      // is the pattern only where base triples are reached for at least twice:
-      // each literal counts once, and so does each later reference to a name
-      // bound to one. A lone `const cols = [1, 4, 7]` is one reach, not boxes.
+      // is the pattern only where base triples are reached at least twice:
+      // each use of a literal counts once, and so does each use of a name bound
+      // to one. A lone `const cols = [1, 4, 7]` is one reach, not boxes.
+      //
+      // A reach is the elements actually being taken out -- iterated, spread, or
+      // subscripted. A triple merely stored is data: MAL2QLszGjE's clue table
+      // gives each circle its three candidate digits, and three of those rows
+      // read [1, 4, 7], which is a digit set and names no cell at all.
+      const consumed = new Set();
+      walkAst(ctx.ast, (node, parent) => {
+        if (!parent) return;
+        if (parent.type === 'MemberExpression' && parent.object === node) consumed.add(node);
+        if (parent.type === 'ForOfStatement' && parent.right === node) consumed.add(node);
+        if (parent.type === 'SpreadElement') consumed.add(node);
+      });
       const triples = ctx.nodesOfType('ArrayExpression').filter((arr) =>
         arr.elements.length === 3
         && [1, 4, 7].every((v, i) => numberValue(arr.elements[i]) === v));
@@ -710,11 +762,10 @@ const RULES = [
           bound.add(decl.id.name);
         }
       }
-      // Identifier nodes include the binding occurrence itself, which is the
-      // literal already counted, so drop one per bound name.
-      const references = ctx.nodesOfType('Identifier')
-        .filter((id) => bound.has(id.name)).length - bound.size;
-      if (triples.length + references >= 2) findings.push(...triples);
+      const reaches = triples.filter((arr) => consumed.has(arr)).length
+        + ctx.nodesOfType('Identifier')
+          .filter((id) => bound.has(id.name) && consumed.has(id)).length;
+      if (reaches >= 2) findings.push(...triples);
       return findings;
     },
   },
@@ -823,7 +874,13 @@ const RULES = [
       + 'off-by-one encodes the wrong puzzle while still linting and solving;\n'
       + 'a grid-shaped Var group read through makeOverlay()/at() needs no index\n'
       + 'math. Literal and additive indices (cell(9), cell(i + 1)) are left\n'
-      + 'alone: only multiplicative row/column folding is flagged.',
+      + 'alone: only multiplicative row/column folding is flagged.\n'
+      + 'Two-argument cell(row, col) is never flagged: that form IS the\n'
+      + 'dimension-aware API this rule steers towards, and it folds against the\n'
+      + 'declared columns itself, so arithmetic in its row argument is addressing\n'
+      + 'the group rather than folding it. A layer whose rows are not 1:1 with\n'
+      + 'grid rows cannot be read through makeOverlay()/at() at all, since that\n'
+      + 'pairs var cells one-to-one with grid cells.',
     check(ctx) {
       const vars = constBindings(ctx, (init) =>
         init.type === 'NewExpression' && calleeName(init) === 'Var');
@@ -832,6 +889,8 @@ const RULES = [
       for (const call of ctx.nodesOfType('CallExpression')) {
         const varName = methodCallOn(call, 'cell', vars);
         const index = call.arguments[0];
+        // One argument only: cell(row, col) does the folding itself.
+        if (call.arguments.length !== 1) continue;
         if (!varName || !index || !subtreeHas(index, (n) =>
           n.type === 'BinaryExpression' && n.operator === '*')) continue;
         findings.push({
@@ -881,16 +940,87 @@ const RULES = [
     },
   },
   {
+    code: 'stale-num-values',
+    summary: 'a `.numValues` read reports the un-widened grid count, not the declared '
+      + "Shape's; pass the Shape itself",
+    docs: 'On a widened board, `graph.gridGeometry()` is a snapshot taken before the\n'
+      + 'returned array\'s `Shape()` is applied, so `.numValues` off it is still the\n'
+      + 'old, narrower count. Anything built from that number is built for the wrong\n'
+      + 'alphabet -- and nothing downstream can tell: the serialized machine is\n'
+      + 'trimmed to its highest used symbol, so too-narrow and never-accepts-the-top\n'
+      + 'are the same object by then. Fires only where the declared Shape widens the\n'
+      + 'grid spec; a read off a Shape-derived binding is the correct idiom and is\n'
+      + 'not flagged.',
+    check(ctx) {
+      const shape = ctx.declaredShape();
+      if (!shape) return [];
+      const base = baseGridValues(shape.spec);
+      // Nothing to be stale against: an unwidened board's grid count IS the final
+      // one. A widening of unknown size (numValues null) still widens.
+      if (base === null || shape.numValues === base) return [];
+
+      // Reads off the Shape, or off anything built from it, are the right idiom.
+      // Derivation is transitive: `cellGraph(shape).gridGeometry()` already carries
+      // the widened count, so the chain has to be followed, not just the first hop.
+      const shapeNames = constBindings(ctx, (init) =>
+        isShapeCall(init) || subtreeHas(init, isShapeCall));
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const decl of ctx.nodesOfType('VariableDeclarator')) {
+          if (decl.id.type !== 'Identifier' || !decl.init) continue;
+          if (shapeNames.has(decl.id.name)) continue;
+          if (!subtreeHas(decl.init, (n) =>
+            n.type === 'Identifier' && shapeNames.has(n.name))) continue;
+          shapeNames.add(decl.id.name);
+          grew = true;
+        }
+      }
+      const rootName = (node) => {
+        let cur = node;
+        while (cur?.type === 'MemberExpression' || cur?.type === 'CallExpression') {
+          cur = cur.type === 'MemberExpression' ? cur.object : cur.callee;
+        }
+        return cur?.type === 'Identifier' ? cur.name : null;
+      };
+
+      const findings = [];
+      for (const read of ctx.nodesOfType('MemberExpression')) {
+        if (memberName(read) !== 'numValues') continue;
+        if (subtreeHas(read.object, isShapeCall)) continue;
+        const root = rootName(read.object);
+        if (root && shapeNames.has(root)) continue;
+        findings.push({
+          node: read,
+          message: shape.numValues === null
+            ? `\`${ctx.text(read)}\` reports the grid spec's ${base} values, but the `
+              + `declared Shape widens the alphabet with \`${shape.raw}\`. Pass the `
+              + 'Shape itself, not a count read before it is applied'
+            : `\`${ctx.text(read)}\` reports the grid spec's ${base} values, but the `
+              + `declared Shape has ${shape.numValues}. Pass the Shape itself, not a `
+              + 'count read before it is applied',
+        });
+      }
+      return findings;
+    },
+  },
+  {
     code: 'num-values-mismatch',
     summary: 'NFA.encodeSpec / Pair.fnToKey numValues literal disagrees with the declared Shape',
     docs: 'Cross-references the `new Shape(...)` alphabet against encodeSpec/fnToKey\n'
-      + 'literals. The alphabet is read from a bare count (`12`), a string range\n'
+      + 'literals. A count given as a top-level numeric const resolves to its value,\n'
+      + 'so renaming the literal does not silence the check (#1762). The alphabet is\n'
+      + 'read from a bare count (`12`), a string range\n'
       + "(`'0-15'`, also in the `'9x9~0-15'` spec form), or a named constant. When it\n"
       + 'is set by an expression the width is unknown but the shape is certainly\n'
       + 'widened, so any bare literal is reported as unverifiable rather than\n'
       + 'skipped -- that case is exactly where a narrow key silently misreads the\n'
       + 'wider domain. A machine compiled for the wrong alphabet is a real bug, but\n'
-      + 'values that flow through helpers stay unresolvable, so this stays heuristic.',
+      + 'values that flow through helpers stay unresolvable, so this stays heuristic.\n'
+      + 'The decided half -- a fnToKey literal against a KNOWN Shape alphabet --\n'
+      + 'cannot be silenced with lint-ok, because a narrow Pair key always decodes\n'
+      + 'as a garbage relation. A decided encodeSpec finding stays suppressible: a\n'
+      + 'narrow NFA merely never accepts the top symbols, which a sentinel-capped\n'
+      + 'scan builds on purpose.',
     check(ctx) {
       const shape = ctx.declaredShape();
       if (!shape) return [];
@@ -899,15 +1029,35 @@ const RULES = [
       for (const call of ctx.valueRangeCalls()) {
         if (call.literal === null) continue;
         if (shape.numValues !== null && call.literal === shape.numValues) continue;
+        // An unverifiable alphabet built from the same constant the call passes
+        // co-varies with it by construction (`0-${N - 1}` against fnToKey(fn, N)):
+        // the mismatch this rule exists for cannot arise, so stay silent rather
+        // than report what the author has already tied together.
+        if (shape.numValues === null && call.aliasName
+          && shape.raw?.includes(call.aliasName)) continue;
+        const spelled = call.aliasName
+          ? `${call.literal} (via \`${call.aliasName}\`)` : String(call.literal);
         findings.push({
           node: call.node,
+          // Decided, so `lint-ok` cannot excuse it: BinaryConstraint.initialize
+          // sizes its table from geometry.numValues whatever the key was compiled
+          // with, so a fnToKey literal differing from a KNOWN alphabet is always a
+          // garbage relation (TYbr45r4oQE shipped an all-UNSAT encoding by
+          // suppressing exactly this; blockers 1425, 1431). A narrow encodeSpec is
+          // "merely" a machine that never accepts the top symbols, but even a
+          // deliberate cap belongs in the domain or the spec, not the table size:
+          // 8L4ffie834I carried one for months and widening to the geometry left
+          // its search bit-for-bit identical. The unverifiable branch stays
+          // suppressible: a call passing the geometry through a helper the walk
+          // cannot see is a real false positive.
+          unsuppressible: shape.numValues !== null,
           message: shape.numValues === null
-            ? `numValues literal ${call.literal} cannot be checked: the Shape's `
+            ? `numValues literal ${spelled} cannot be checked: the Shape's `
               + `alphabet is set by \`${shape.raw}\`, so it is widened by an unknown `
               + 'amount. Pass the Shape or the geometry itself, never a literal'
-            : `numValues literal ${call.literal} does not match the declared `
+            : `numValues literal ${spelled} does not match the declared `
               + `Shape's ${shape.numValues} values; pass the Shape or cellGeometry() `
-              + 'instead of a literal',
+              + 'instead of a literal (this finding cannot be suppressed)',
         });
       }
       return findings;
@@ -1000,7 +1150,10 @@ export const lintSource = (source, { only = null, ignore = null } = {}) => {
     rule.check(ctx).map((finding) => findingToItem(rule, finding)));
   const suppressed = suppressionsByLine(ctx);
   return dedupeGuidance(
-    items.filter(item => !suppressed.get(item.line)?.has(item.code)));
+    items
+      .filter(item => item.unsuppressible
+        || !suppressed.get(item.line)?.has(item.code))
+      .map(({ unsuppressible, ...item }) => item));
 };
 
 const USAGE = `\

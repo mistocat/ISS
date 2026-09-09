@@ -1,7 +1,10 @@
-const { memoize, MultiMap, countOnes16bit } = await import('../util.js' + self.VERSION_PARAM);
+const { memoize, MultiMap, countOnes16bit, sortedArrayCopy, insertionSortInts } = await import('../util.js' + self.VERSION_PARAM);
 const { LookupTables } = await import('./lookup_tables.js' + self.VERSION_PARAM);
 const { SudokuConstraintHandler, HandlerUtil, InvalidConstraintError } = await import('./handlers.js' + self.VERSION_PARAM);
 const { GEOMETRY_MAX, GEOMETRY_9x9 } = await import('../cell_geometry.js' + self.VERSION_PARAM);
+
+// Scratch for the cell -> index map in Sum.initialize.
+let cellIndexScratch = new Uint16Array(0);
 
 // Enforces a weighted linear equation `Σ coeff·value = sum` over the cells
 // (killer cages, arithmetic sums, equalities). See sum.md for the full
@@ -29,13 +32,19 @@ export class Sum extends SudokuConstraintHandler {
   }
 
   constructor(cells, sum, coeffs) {
-    const cellSet = new Set(cells);
     let coeffGroups;
 
-    if (cellSet.size === cells.length && !coeffs) {
-      // Shortcut the common case.
-      coeffGroups = [{ coeff: 1, cells: [...cells], exclusionGroups: [] }];
-    } else {
+    if (!coeffs) {
+      // Sorting is needed anyway for a consistent dedupId, and deduping it at the
+      // same time doubles as the duplicate check.
+      const sortedCells = sortedArrayCopy(cells, /* removeDuplicates= */ true);
+      if (sortedCells.length === cells.length) {
+        // Shortcut the common case.
+        coeffGroups = [{ coeff: 1, cells: sortedCells, exclusionGroups: [] }];
+      }
+    }
+
+    if (coeffGroups === undefined) {
       coeffs = coeffs || Array(cells.length).fill(1);
 
       if (coeffs.length !== cells.length) {
@@ -51,7 +60,7 @@ export class Sum extends SudokuConstraintHandler {
 
       // If there are duplicates, then update the coefficients.
       // Not as efficient as it could be, but this is a rare case.
-      if (cellSet.size !== cells.length) {
+      if (new Set(cells).size !== cells.length) {
         const cellMap = new Map();
         for (let i = 0; i < cells.length; i++) {
           const cell = cells[i];
@@ -78,21 +87,25 @@ export class Sum extends SudokuConstraintHandler {
       for (let [coeff, coeffCells] of coeffMap) {
         coeffGroups.push({ coeff, cells: coeffCells, exclusionGroups: [] });
       }
-    }
 
-    // Sort cells for consistent idStr and exclusion cell performance.
-    coeffGroups.forEach(g => g.cells.sort((a, b) => a - b));
+      // Sort cells for consistent dedupId and exclusion cell performance.
+      for (const g of coeffGroups) insertionSortInts(g.cells);
+    }
 
     super(cells);
     this._rawSum = +sum;
     this._coeffGroups = coeffGroups;
 
-    this.idStr = [
+  }
+
+  static DEDUPES = true;
+
+  dedupId() {
+    return [
       this.constructor.name,
-      sum,
+      this._rawSum,
       ...this._coeffGroups.map(g => g.coeff + ':' + g.cells.join(','))
     ].join('|');
-
   }
 
   onlyUnitCoeffs() {
@@ -211,8 +224,13 @@ export class Sum extends SudokuConstraintHandler {
 
     {
       this._exclusionGroupIds = new Int16Array(this.cells.length);
-      const cellLookup = new Uint16Array(cellExclusions.numSearchCells());
-      this.cells.forEach((c, i) => cellLookup[c] = i);
+      const numSearchCells = cellExclusions.numSearchCells();
+      if (cellIndexScratch.length < numSearchCells) {
+        cellIndexScratch = new Uint16Array(numSearchCells);
+      }
+      const cellLookup = cellIndexScratch;
+      const cells = this.cells;
+      for (let i = 0; i < cells.length; i++) cellLookup[cells[i]] = i;
 
       for (let i = 0; i < this._coeffGroups.length; i++) {
         const { exclusionGroups, coeff } = this._coeffGroups[i];
@@ -568,7 +586,7 @@ export class Sum extends SudokuConstraintHandler {
         const x = v << sumMinusMin;
         // Remove any values GREATER than x. Even if all other squares
         // take their minimum values, these are too big.
-        if (!(v &= ((x & -x) << 1) - 1)) return false;
+        if (!(v &= x ^ (x - 1))) return false;
         grid[cells[i]] = v;
       }
 

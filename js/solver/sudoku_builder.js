@@ -2,7 +2,7 @@ const { SudokuConstraint, SudokuConstraintBase, CellArgs } = await import('../su
 const { CellGeometry, CellGraph } = await import('../cell_geometry.js' + self.VERSION_PARAM);
 const { SudokuSolver } = await import('./engine.js' + self.VERSION_PARAM);
 const { regexToNFA, NFASerializer } = await import('../nfa_builder.js' + self.VERSION_PARAM);
-const { memoize } = await import('../util.js' + self.VERSION_PARAM);
+const { memoize, insertionSortInts } = await import('../util.js' + self.VERSION_PARAM);
 const HandlerModule = await import('./handlers.js' + self.VERSION_PARAM);
 const SumHandlerModule = await import('./sum_handler.js' + self.VERSION_PARAM);
 const NFAHandlerModule = await import('./nfa_handler.js' + self.VERSION_PARAM);
@@ -149,6 +149,10 @@ export class SudokuBuilder {
     if (geometry.gridType === CellGeometry.SUDOKU_GRID_TYPE) {
       yield* this._rowColHandlers(geometry);
     }
+    // The YinYang grid type's implicit constraints.
+    if (geometry.gridType === CellGeometry.YIN_YANG_GRID_TYPE) {
+      yield* this._yinYangLayerHandlers(geometry, 0, geometry.numGridCells);
+    }
 
     yield new HandlerModule.BoxRegionInfo(context.spec.boxRegions);
     yield* this._boxHandlers(context.spec.boxRegions);
@@ -202,20 +206,42 @@ export class SudokuBuilder {
     }
   }
 
+  static *_yinYangLayerHandlers(geometry, cellOffset, numCells) {
+    const shades = [geometry.minValue(), geometry.minValue() + 1];
+    yield new HandlerModule.GivenCandidates(new Map(
+      Array.from({ length: numCells }, (_, i) => [cellOffset + i, shades])));
+    for (const shade of shades) {
+      yield new ConnectedHandlerModule.ConnectedValues(
+        numCells, cellOffset, new Map([[[shade], 0]]));
+    }
+
+    // Anti-2x2: both shades must appear in each box.
+    const graph = geometry.cellGraph();
+    for (let i = 0; i < numCells; i++) {
+      const nw = cellOffset + i;
+      const ne = graph.traverse(nw, 0, 1);
+      const sw = graph.traverse(nw, 1, 0);
+      const se = graph.traverse(nw, 1, 1);
+      if (ne !== null && sw !== null && se !== null) {
+        yield new HandlerModule.RequiredValues(
+          [nw, ne, sw, se], shades, /* strict = */ false);
+      }
+    }
+  }
+
   static *_strictAdjHandlers(constraints, geometry, fnKey) {
     const numCells = geometry.numGridCells;
-    const intCmp = (a, b) => a - b;
     const pairId = p => p[0] + p[1] * numCells;
 
     // Find all the cell pairs that have constraints.
     const cellPairs = constraints
       .flatMap(c => c.adjacentPairs(geometry));
-    cellPairs.forEach(p => p.sort(intCmp));
+    for (const p of cellPairs) insertionSortInts(p);
     const pairIds = new Set(cellPairs.map(pairId));
 
     // Add negative constraints for all other cell pairs.
     for (const p of this._allAdjacentCellPairs(geometry)) {
-      p.sort(intCmp);
+      insertionSortInts(p);
       if (pairIds.has(pairId(p))) continue;
       yield new HandlerModule.BinaryConstraint(
         p[0], p[1], fnKey);
@@ -383,6 +409,10 @@ export class SudokuBuilder {
               throw new InvalidConstraintError(
                 'Chaos Construction requires grid cell count to be divisible by region size.');
             }
+            if (regionSize > geometry.numValues) {
+              throw new InvalidConstraintError(
+                'Chaos Construction region size cannot exceed the number of values.');
+            }
             const regionCells = geometry.varCellsForGroup('CC');
             if (!regionCells || regionCells.length !== geometry.numGridCells) {
               throw new InvalidConstraintError(
@@ -486,8 +516,7 @@ export class SudokuBuilder {
                 'Pill Arrow must have more cells than the pill size');
             }
 
-            const pillCells = cells.slice(0, pillSize);
-            pillCells.sort((a, b) => a - b);
+            const pillCells = insertionSortInts(cells.slice(0, pillSize));
 
             // Sorting the pill cells only gives an unambiguous reading order
             // when each successive cell is one step right, down, or down-right
@@ -663,11 +692,7 @@ export class SudokuBuilder {
 
         case 'Thermo':
           cells = constraint.cells.map(c => geometry.parseCellId(c).cellIndex);
-          for (let i = 1; i < cells.length; i++) {
-            yield new HandlerModule.BinaryConstraint(
-              cells[i - 1], cells[i],
-              SudokuConstraint.Thermo.fnKey(geometry.numValues, geometry.valueOffset));
-          }
+          yield new HandlerModule.Thermo(cells);
           break;
 
         case 'Whisper':
@@ -948,6 +973,14 @@ export class SudokuBuilder {
               cellOffset,
               new Map([
                 [constraint.values.split('_').map(v => +v), constraint.size || 0]]));
+          }
+          break;
+
+        case 'YinYang':
+          {
+            const groupCells = geometry.varCellsForGroup('YY');
+            yield* this._yinYangLayerHandlers(
+              geometry, groupCells[0], groupCells.length);
           }
           break;
 
